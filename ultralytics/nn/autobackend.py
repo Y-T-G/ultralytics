@@ -417,6 +417,8 @@ class AutoBackend(nn.Module):
             imgsz = metadata["imgsz"]
             names = metadata["names"]
             kpt_shape = metadata.get("kpt_shape")
+        elif triton and not data:
+            raise ValueError("Triton inference requires providing 'data=data.yaml' with the names.")
         elif not (pt or triton or nn_module):
             LOGGER.warning(f"WARNING ⚠️ Metadata not found for 'model={weights}'")
 
