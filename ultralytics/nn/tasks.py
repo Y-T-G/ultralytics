@@ -317,11 +317,12 @@ class DetectionModel(BaseModel):
         self.inplace = self.yaml.get("inplace", True)
         self.end2end = getattr(self.model[-1], "end2end", False)
 
-        # Build strides
+        # Build layer and strides
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect
             s = 256  # 2x min stride
             m.inplace = self.inplace
+            m.build_layer(int(torch.ceil(torch.tensor(self.yaml.get("imgsz", 640) / 40))))
 
             def _forward(x):
                 """Performs a forward pass through the model, handling different Detect subclass types accordingly."""

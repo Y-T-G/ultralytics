@@ -36,8 +36,8 @@ class Detect(nn.Module):
         self.nl = len(ch)  # number of detection layers
         self.ch = ch # input channels
 
-    def build_layer(self, x):
-        self.reg_max = math.ceil(x[0].shape[-1] / 2)  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
+    def build_layer(self, reg_max=16):
+        self.reg_max = reg_max  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
         self.no = self.nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, self.ch[0] // 4, self.reg_max * 4)), max(self.ch[0], min(self.nc, 100))  # channels
@@ -52,10 +52,7 @@ class Detect(nn.Module):
             self.one2one_cv3 = copy.deepcopy(self.cv3)
 
     def forward(self, x):
-        """Concatenates and returns predicted bounding boxes and class probabilities."""
-        if not hasattr(self, "reg_max"):
-            self.build_layer(x)
-    
+        """Concatenates and returns predicted bounding boxes and class probabilities."""    
         if self.end2end:
             return self.forward_end2end(x)
 
