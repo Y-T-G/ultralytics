@@ -236,6 +236,7 @@ class v8DetectionLoss:
             gt_labels,
             gt_bboxes,
             mask_gt,
+            2 * (self.reg_max - 1)  * stride_tensor.view(-1),
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
@@ -310,6 +311,7 @@ class v8SegmentationLoss(v8DetectionLoss):
             gt_labels,
             gt_bboxes,
             mask_gt,
+            2 * (self.reg_max - 1)  * stride_tensor.view(-1),
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
@@ -490,6 +492,7 @@ class v8PoseLoss(v8DetectionLoss):
             gt_labels,
             gt_bboxes,
             mask_gt,
+            2 * (self.reg_max - 1)  * stride_tensor.view(-1),
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
@@ -683,6 +686,7 @@ class v8OBBLoss(v8DetectionLoss):
             gt_labels,
             gt_bboxes,
             mask_gt,
+            2 * (self.reg_max - 1)  * stride_tensor.view(-1),
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
