@@ -934,6 +934,24 @@ class Model(nn.Module):
         return next(self.model.parameters()).device if isinstance(self.model, nn.Module) else None
 
     @property
+    def training(self) -> bool:
+        """
+        Gets the training mode from the associated model.
+
+        Returns:
+            (bool): Boolean represents whether this module is in training or evaluation mode.
+
+        Examples:
+            >>> model = Model()
+            >>> print(model.training)
+            True
+
+        Raises:
+            AttributeError: If the model is not a PyTorch nn.Module instance.
+        """
+        return self.model.training if isinstance(self.model, nn.Module) else None
+
+    @property
     def transforms(self):
         """
         Retrieves the transformations applied to the input data of the loaded model.
