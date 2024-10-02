@@ -949,7 +949,16 @@ class Model(nn.Module):
         Raises:
             AttributeError: If the model is not a PyTorch nn.Module instance.
         """
-        return self.model.training if isinstance(self.model, nn.Module) else None
+        return self.model.training if isinstance(self.model, nn.Module) else False
+    
+    @training.setter
+    def training(self, value) -> None:
+        """
+        This a dummy method used to avoid a PyTorch error that occurs during
+        the initialization of Model due to the overriding of training
+        property.
+        """
+        pass
 
     @property
     def transforms(self):
