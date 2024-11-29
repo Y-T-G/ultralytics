@@ -983,7 +983,7 @@ class RandomPerspective:
     """
 
     def __init__(
-        self, degrees=0.0, translate=0.1, scale=0.5, shear=0.0, perspective=0.0, border=(0, 0), pre_transform=None
+        self, degrees=0.0, translate=0.1, scale=0.5, shear=0.0, perspective=0.0, border=(0, 0), pre_transform=None, post_transform=None
     ):
         """
         Initializes RandomPerspective object with transformation parameters.
@@ -1000,6 +1000,8 @@ class RandomPerspective:
             border (Tuple[int, int]): Tuple specifying mosaic border (top/bottom, left/right).
             pre_transform (Callable | None): Function/transform to apply to the image before starting the random
                 transformation.
+            post_transform (Callable | None): Function/transform to apply to the image after completing the random
+                transformation.
 
         Examples:
             >>> transform = RandomPerspective(degrees=10.0, translate=0.1, scale=0.5, shear=5.0)
@@ -1012,6 +1014,7 @@ class RandomPerspective:
         self.perspective = perspective
         self.border = border  # mosaic border
         self.pre_transform = pre_transform
+        self.post_transform = post_transform
 
     def affine_transform(self, img, border):
         """
@@ -1218,7 +1221,7 @@ class RandomPerspective:
         """
         if self.pre_transform and "mosaic_border" not in labels:
             labels = self.pre_transform(labels)
-        labels.pop("ratio_pad", None)  # do not need ratio pad
+            labels.pop("ratio_pad", None)  # do not need ratio pad
 
         img = labels["img"]
         cls = labels["cls"]
@@ -1257,6 +1260,11 @@ class RandomPerspective:
         labels["cls"] = cls[i]
         labels["img"] = img
         labels["resized_shape"] = img.shape[:2]
+
+        if self.post_transform and "mosaic_border" not in labels:
+            labels = self.post_transform(labels)
+            labels.pop("ratio_pad", None)  # do not need ratio pad
+
         return labels
 
     def box_candidates(self, box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):
@@ -2300,7 +2308,8 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
         scale=hyp.scale,
         shear=hyp.shear,
         perspective=hyp.perspective,
-        pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
+        pre_transform=None if stretch or hyp.hi_res else LetterBox(new_shape=(imgsz, imgsz)),
+        post_transform = None if stretch or not hyp.hi_res else LetterBox(new_shape=(imgsz, imgsz)),
     )
 
     pre_transform = Compose([mosaic, affine])

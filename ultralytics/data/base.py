@@ -78,6 +78,7 @@ class BaseDataset(Dataset):
         self.batch_size = batch_size
         self.stride = stride
         self.pad = pad
+        self.hi_res = hyp.hi_res
         if self.rect:
             assert self.batch_size is not None
             self.set_rectangle()
@@ -169,9 +170,12 @@ class BaseDataset(Dataset):
                 r = self.imgsz / max(h0, w0)  # ratio
                 if r != 1:  # if sizes are not equal
                     w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
-                    im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
+                    if not self.hi_res:
+                        im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
             elif not (h0 == w0 == self.imgsz):  # resize by stretching image to square imgsz
-                im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+                w, h = self.imgsz, self.imgsz
+                if not self.hi_res:
+                    im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
 
             # Add to buffer if training with augmentations
             if self.augment:
