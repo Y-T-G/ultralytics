@@ -22,6 +22,7 @@ __all__ = (
     "Concat",
     "RepConv",
     "Index",
+    "Permute",
 )
 
 
@@ -348,3 +349,20 @@ class Index(nn.Module):
         Expects a list of tensors as input.
         """
         return x[self.index]
+
+
+class Permute(nn.Module):
+    """Permutes the input tensor."""
+
+    def __init__(self, c1, c2, dims):
+        """Permutes the input tensor."""
+        super().__init__()
+        self.dims = dims
+
+    def forward(self, x):
+        """
+        Forward pass.
+
+        Expects a list of tensors as input.
+        """
+        return x.permute(*self.dims)

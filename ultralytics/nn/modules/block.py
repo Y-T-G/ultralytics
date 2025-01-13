@@ -1139,10 +1139,12 @@ class TorchVision(nn.Module):
         else:
             self.m = torchvision.models.__dict__[model](pretrained=bool(weights))
         if unwrap:
-            layers = list(self.m.children())[:-truncate]
+            layers = list(self.m.children())
             if isinstance(layers[0], nn.Sequential):  # Second-level for some models like EfficientNet, Swin
                 layers = [*list(layers[0].children()), *layers[1:]]
             self.m = nn.Sequential(*layers)
+            if truncate:
+                self.m = self.m[:-truncate]
             self.split = split
         else:
             self.split = False
