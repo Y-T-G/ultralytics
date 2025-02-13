@@ -1,0 +1,21 @@
+name: macOS Test Runner
+on: [push, pull_request]
+
+jobs:
+    test:
+        runs-on: macos-latest
+        steps:
+        - name: Checkout code
+          uses: actions/checkout@v4
+
+        - name: Set up Python
+          uses: actions/setup-python@v5
+          with:
+            python-version: '3.x'
+
+        - name: Install dependencies
+          run: pip install -e .
+
+        - name: Setup tmate session
+          uses: mxschmitt/action-tmate@v3
+          if: failure()
