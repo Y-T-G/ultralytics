@@ -10,9 +10,9 @@ on:
     types: [opened, edited]
   discussion:
     types: [created]
-  pull_request:
-    branches: [main]
-    types: [opened, closed, synchronize, review_requested]
+  # pull_request:
+  #   branches: [main]
+  #   types: [opened, closed, synchronize, review_requested]
 
 jobs:
   format:
