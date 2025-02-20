@@ -35,11 +35,11 @@ keywords: Ultralytics, utils, TQDM, Python, ML, Machine Learning utilities, YOLO
 
 <br><br><hr><br>
 
-## ::: ultralytics.utils.SettingsManager
+## ::: ultralytics.utils.JSONDict
 
 <br><br><hr><br>
 
-## ::: ultralytics.utils.PersistentCacheDict
+## ::: ultralytics.utils.SettingsManager
 
 <br><br><hr><br>
 
@@ -84,6 +84,10 @@ keywords: Ultralytics, utils, TQDM, Python, ML, Machine Learning utilities, YOLO
 <br><br><hr><br>
 
 ## ::: ultralytics.utils.is_jupyter
+
+<br><br><hr><br>
+
+## ::: ultralytics.utils.is_runpod
 
 <br><br><hr><br>
 

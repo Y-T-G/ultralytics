@@ -10,11 +10,11 @@ keywords: ClearML, YOLOv5, machine learning, experiment tracking, data versionin
 
 ## About ClearML
 
-[ClearML](https://clear.ml/) is an [open-source](https://github.com/allegroai/clearml) toolbox designed to save you time ⏱️.
+[ClearML](https://clear.ml/) is an [open-source](https://github.com/clearml/clearml) toolbox designed to save you time ⏱️.
 
 🔨 Track every YOLOv5 training run in the <b>experiment manager</b>
 
-🔧 Version and easily access your custom training data with the integrated ClearML <b>Data Versioning Tool</b>
+🔧 Version and easily access your custom [training data](https://www.ultralytics.com/glossary/training-data) with the integrated ClearML <b>Data Versioning Tool</b>
 
 🔦 <b>Remotely train and monitor</b> your YOLOv5 training runs using ClearML Agent
 
@@ -85,8 +85,8 @@ This will capture:
 - Console output
 - Scalars (mAP_0.5, mAP_0.5:0.95, precision, recall, losses, learning rates, ...)
 - General info such as machine details, runtime, creation date etc.
-- All produced plots such as label correlogram and confusion matrix
-- Images with bounding boxes per epoch
+- All produced plots such as label correlogram and [confusion matrix](https://www.ultralytics.com/glossary/confusion-matrix)
+- Images with bounding boxes per [epoch](https://www.ultralytics.com/glossary/epoch)
 - Mosaic per epoch
 - Validation images per epoch
 
@@ -102,7 +102,7 @@ Versioning your data separately from your code is generally a good idea and make
 
 ### Prepare Your Dataset
 
-The YOLOv5 repository supports a number of different datasets by using YAML files containing their information. By default datasets are downloaded to the `../datasets` folder in relation to the repository root folder. So if you downloaded the `coco128` dataset using the link in the YAML or with the scripts provided by yolov5, you get this folder structure:
+The YOLOv5 repository supports a number of different datasets by using YAML files containing their information. By default, datasets are downloaded to the `../datasets` folder in relation to the repository root folder. So if you downloaded the `coco128` dataset using the link in the YAML or with the scripts provided by yolov5, you get this folder structure:
 
 ```
 ..

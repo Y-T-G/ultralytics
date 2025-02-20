@@ -34,7 +34,7 @@ Follow the [Train Model](./models.md#train-model) instructions from the [Models]
 
     ![Ultralytics HUB screenshot of the Model page with an arrow pointing to the Start Training card](https://github.com/ultralytics/docs/releases/download/0/hub-cloud-training-model-page-start-training.avif)
 
-Most of the times, you will use the Epochs training. The number of epochs can be adjusted on this step (if the training didn't start yet) and represents the number of times your dataset needs to go through the cycle of train, label, and test. The exact pricing based on the number of epochs is hard to determine, reason why we only allow the [Account Balance](./pro.md#account-balance) payment method.
+Most of the time, you will use the Epochs training. The number of epochs can be adjusted on this step (if the training didn't start yet) and represents the number of times your dataset needs to go through the cycle of train, label, and test. The exact pricing based on the number of epochs is hard to determine, reason why we only allow the [Account Balance](./pro.md#account-balance) payment method.
 
 !!! note
 
@@ -44,7 +44,7 @@ Most of the times, you will use the Epochs training. The number of epochs can be
 
 !!! note
 
-    When using the Epochs training, the [account balance](./pro.md#account-balance) is deducted after every epoch.
+    When using the Epochs training, the [account balance](./pro.md#account-balance) is deducted after every [epoch](https://www.ultralytics.com/glossary/epoch).
 
     Also, after every epoch, we check if you have enough [account balance](./pro.md#account-balance) for the next epoch. In case you don't have enough [account balance](./pro.md#account-balance) for the next epoch, we will stop the training session, allowing you to resume training your model from the last checkpoint saved.
 

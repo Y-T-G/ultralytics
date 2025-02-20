@@ -19,7 +19,7 @@ keywords: Ultralytics, data collection, YOLO, Python package, Google Analytics, 
 - **System Information**: We collect general non-identifiable information about your computing environment to ensure our package performs well across various systems.
 - **Performance Data**: Understanding the performance of our models during training, validation, and inference helps us in identifying optimization opportunities.
 
-For more information about Google Analytics and data privacy, visit [Google Analytics Privacy](https://support.google.com/analytics/answer/6004245).
+For more information about Google Analytics and [data privacy](https://www.ultralytics.com/glossary/data-privacy), visit [Google Analytics Privacy](https://support.google.com/analytics/answer/6004245).
 
 ### How We Use This Data
 
@@ -153,7 +153,8 @@ Ultralytics collects three primary types of data using Google Analytics:
 - **Usage Metrics**: These include how often and in what ways the YOLO Python package is used, preferred features, and typical command-line arguments.
 - **System Information**: General non-identifiable information about the computing environments where the package is run.
 - **Performance Data**: Metrics related to the performance of models during training, validation, and inference.
-    This data helps us enhance user experience and optimize software performance. Learn more in the [Anonymized Google Analytics](#anonymized-google-analytics) section.
+
+This data helps us enhance user experience and optimize software performance. Learn more in the [Anonymized Google Analytics](#anonymized-google-analytics) section.
 
 ### How can I disable data collection in the Ultralytics YOLO package?
 
