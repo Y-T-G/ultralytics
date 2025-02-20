@@ -72,15 +72,15 @@ class TaskAlignedAssigner(nn.Module):
             )
 
         try:
-            return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+            return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, max_dists)
         except torch.OutOfMemoryError:
             # Move tensors to CPU, compute, then move back to original device
             LOGGER.warning("WARNING: CUDA OutOfMemoryError in TaskAlignedAssigner, using CPU")
-            cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)]
+            cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, max_dists)]
             result = self._forward(*cpu_tensors)
             return tuple(t.to(device) for t in result)
 
-    def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+    def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, max_dists):
         """
         Compute the task-aligned assignment. Reference code is available at
         https://github.com/Nioolek/PPYOLOE_pytorch/blob/master/ppyoloe/assigner/tal_assigner.py.
@@ -92,6 +92,7 @@ class TaskAlignedAssigner(nn.Module):
             gt_labels (Tensor): shape(bs, n_max_boxes, 1)
             gt_bboxes (Tensor): shape(bs, n_max_boxes, 4)
             mask_gt (Tensor): shape(bs, n_max_boxes, 1)
+            max_dists (Tensor): shape(bs, num_total_anchors, 2)
 
         Returns:
             target_labels (Tensor): shape(bs, num_total_anchors)
