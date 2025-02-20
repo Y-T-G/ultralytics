@@ -48,7 +48,7 @@ class TaskAlignedAssigner(nn.Module):
             gt_labels (Tensor): shape(bs, n_max_boxes, 1)
             gt_bboxes (Tensor): shape(bs, n_max_boxes, 4)
             mask_gt (Tensor): shape(bs, n_max_boxes, 1)
-            max_dists (Tensor): shape(bs, num_total_anchors)
+            max_dists (Tensor): shape(bs, num_total_anchors, 2)
 
         Returns:
             target_labels (Tensor): shape(bs, num_total_anchors)
@@ -216,7 +216,7 @@ class TaskAlignedAssigner(nn.Module):
         Args:
             xy_centers (torch.Tensor): Anchor center coordinates, shape (h*w, 2).
             gt_bboxes (torch.Tensor): Ground truth bounding boxes, shape (b, n_boxes, 4).
-            max_dists (torch.Tensor): Maximum regressable distance of each anchor (b, n_anchors).
+            max_dists (torch.Tensor): Maximum regressable distance of each anchor (b, n_anchors, 2).
             eps (float, optional): Small value for numerical stability. Defaults to 1e-9.
 
         Returns:
@@ -230,9 +230,21 @@ class TaskAlignedAssigner(nn.Module):
         bs, n_boxes, _ = gt_bboxes.shape
         lt, rb = gt_bboxes.view(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom
         bbox_deltas = torch.cat((xy_centers[None] - lt, rb - xy_centers[None]), dim=2).view(bs, n_boxes, n_anchors, -1)
+        # The x, y lengths of each bbox
+        bbox_lengths = (gt_bboxes[..., 2:] - gt_bboxes[..., :2])[:, :, None, :].expand(bs, n_boxes, n_anchors, 2)
+        # Assign to minimum possible scales
+        # Eg., if bbox_length is 120, and the max_dists for each scale is [160, 320, 640], a scale mask of [True, False, False] 
+        # should be created. This is because 160 is minimum value is that is less than equal to the bbox_length,
+        # i.e., we are trying to assign the box to the minimum possible scale.
+        max_dists = max_dists[None, None, :, :].expand(bs, n_boxes, n_anchors, 2)
+        valid_anchors = max_dists[max_dists >= bbox_lengths]
+        if valid_anchors.numel() > 0:
+            min_scale = valid_anchors.amin(0)
+            scale_mask = (max_dists == min_scale).all(dim=-1)
+        else:
+            scale_mask = torch.zeros_like(max_dists[..., 0], dtype=torch.bool)
         # return (bbox_deltas.min(3)[0] > eps).to(gt_bboxes.dtype)
-        return bbox_deltas.amin(3).gt_(eps) * bbox_deltas.amax(3).lt_(max_dists)
-
+        return bbox_deltas.amin(3).gt_(eps) * scale_mask
     @staticmethod
     def select_highest_overlaps(mask_pos, overlaps, n_max_boxes):
         """
