@@ -111,7 +111,11 @@ class TaskAlignedAssigner(nn.Module):
         target_labels, target_bboxes, target_scores = self.get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask)
 
         # The x, y lengths of each bbox
-        bbox_lengths = (gt_bboxes[..., 2:] - gt_bboxes[..., :2])[:, :, None, :]
+        if gt_bboxes.shape[-1] == 5:
+            bboxes = xywhr2xyxyxyxy(gt_bboxes)[:, :, [0,2]].flatten(-2)
+        else:
+            bboxes = gt_bboxes
+        bbox_lengths = (bboxes[..., 2:] - bboxes[..., :2])[:, :, None, :]
         # Apply mask based on how well the scale covers the boxes
         # Eg., if bbox_length is 170, and the max_dists for each scale is [160, 320, 640], the mask would be [False, True, True]
         # should be created.
