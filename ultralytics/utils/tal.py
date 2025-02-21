@@ -102,7 +102,7 @@ class TaskAlignedAssigner(nn.Module):
             target_gt_idx (Tensor): shape(bs, num_total_anchors)
         """
         mask_pos, align_metric, overlaps = self.get_pos_mask(
-            pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt, max_dists
+            pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt
         )
 
         target_gt_idx, fg_mask, mask_pos = self.select_highest_overlaps(mask_pos, overlaps, self.n_max_boxes)
@@ -110,8 +110,16 @@ class TaskAlignedAssigner(nn.Module):
         # Assigned target
         target_labels, target_bboxes, target_scores = self.get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask)
 
+        # The x, y lengths of each bbox
+        bbox_lengths = (gt_bboxes[..., 2:] - gt_bboxes[..., :2])[:, :, None, :]
+        # Apply mask based on how well the scale covers the boxes
+        # Eg., if bbox_length is 170, and the max_dists for each scale is [160, 320, 640], the mask would be [False, True, True]
+        # should be created.
+        max_dists = max_dists[None, None, :, :]
+        scale_mask = (max_dists > bbox_lengths).all(dim=-1)
+    
         # Normalize
-        align_metric *= mask_pos
+        align_metric *= mask_pos * scale_mask
         pos_align_metrics = align_metric.amax(dim=-1, keepdim=True)  # b, max_num_obj
         pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)  # b, max_num_obj
         norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
@@ -119,9 +127,9 @@ class TaskAlignedAssigner(nn.Module):
 
         return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
 
-    def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt, max_dists):
+    def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
         """Get in_gts mask, (b, max_num_obj, h*w)."""
-        mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes, max_dists)
+        mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes)
         # Get anchor_align metric, (b, max_num_obj, h*w)
         align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
         # Get topk_metric mask, (b, max_num_obj, h*w)
@@ -240,14 +248,13 @@ class TaskAlignedAssigner(nn.Module):
         return target_labels, target_bboxes, target_scores
 
     @staticmethod
-    def select_candidates_in_gts(xy_centers, gt_bboxes, max_dists, eps=1e-9):
+    def select_candidates_in_gts(xy_centers, gt_bboxes, eps=1e-9):
         """
         Select positive anchor centers within ground truth bounding boxes.
 
         Args:
             xy_centers (torch.Tensor): Anchor center coordinates, shape (h*w, 2).
             gt_bboxes (torch.Tensor): Ground truth bounding boxes, shape (b, n_boxes, 4).
-            max_dists (torch.Tensor): Maximum regressable distance of each anchor (b, n_anchors, 2).
             eps (float, optional): Small value for numerical stability. Defaults to 1e-9.
 
         Returns:
@@ -261,16 +268,8 @@ class TaskAlignedAssigner(nn.Module):
         bs, n_boxes, _ = gt_bboxes.shape
         lt, rb = gt_bboxes.view(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom
         bbox_deltas = torch.cat((xy_centers[None] - lt, rb - xy_centers[None]), dim=2).view(bs, n_boxes, n_anchors, -1)
-        # The x, y lengths of each bbox
-        bbox_lengths = (gt_bboxes[..., 2:] - gt_bboxes[..., :2])[:, :, None, :].expand(bs, n_boxes, n_anchors, 2)
-        # Assign to largest scales that can cover the object
-        # Eg., if bbox_length is 170, and the max_dists for each scale is [160, 320, 640], a scale mask of [False, True, True] 
-        # should be created.
-        max_dists = max_dists[None, None, :, :].expand(bs, n_boxes, n_anchors, 2)
-        scale_mask = (max_dists >= bbox_lengths).all(dim=-1)
-
         # return (bbox_deltas.min(3)[0] > eps).to(gt_bboxes.dtype)
-        return bbox_deltas.amin(3).gt_(eps) * scale_mask
+        return bbox_deltas.amin(3).gt_(eps)
     @staticmethod
     def select_highest_overlaps(mask_pos, overlaps, n_max_boxes):
         """
