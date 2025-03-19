@@ -687,6 +687,7 @@ class v8OBBLoss(v8DetectionLoss):
             gt_labels,
             gt_bboxes,
             mask_gt,
+            imgsz * stride_tensor / self.stride[-1],
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
