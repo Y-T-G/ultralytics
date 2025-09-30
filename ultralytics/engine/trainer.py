@@ -580,10 +580,10 @@ class BaseTrainer:
         model = deepcopy(unwrap_model(self.ema.ema))
         extras = {}
         if hasattr(model, "_modelopt_state"):
-            import modelopt.torch.opt as mto
+            import nncf
 
             extras = {  # model can't be pickled; saving state_dict
-                "modelopt_state": mto.modelopt_state(model),
+                "nncf_config": nncf.torch.get_config(model),
                 "state_dict": model.state_dict(),
                 "model_class": model.__class__,
                 "yaml": model.yaml,
@@ -713,38 +713,26 @@ class BaseTrainer:
     def build_quantized_model(self):
         """Adds quantization layers to model for QAT training."""
         from ultralytics.utils.checks import check_requirements
-
-        check_requirements("nvidia-modelopt")
-
-        import modelopt.torch.quantization as mtq
-
         from ultralytics.data.build import build_dataloader
 
-        config = {
-            "quant_cfg": {
-                "*weight_quantizer": {"num_bits": 8, "axis": 0},  # Per-channel weight quantization
-                "*input_quantizer": {"num_bits": 8, "axis": None},  # Per-tensor activation quantization
-                "*output_quantizer": {"num_bits": 8, "axis": None},
-            },
-            "algorithm": "max",  # Calibration algorithm
-        }
+        check_requirements("packaging>=23.2")  # must be installed first to build nncf wheel
+        check_requirements("nncf>=2.14.0")
+
+        import nncf
 
         with torch_distributed_zero_first(LOCAL_RANK):  # init dataset *.cache only once if DDP
             dataset = self.build_dataset(self.data["val"], "quantize", self.args.batch)
-        calib_loader = build_dataloader(dataset, batch=self.args.batch, workers=0, drop_last=True)
+        calib_loader = build_dataloader(dataset, batch=1, workers=0, drop_last=True)
 
-        @smart_inference_mode()
-        def forward_loop(model):
-            model.eval()
-            count, num_samples = 0, 512  # max calibration samples
-            for batch in calib_loader:
-                if count >= num_samples:
-                    break
-                images = self.preprocess_batch(batch)["img"]
-                model(images)
-                count += images.shape[0]
+        def transform_fn(data_item):
+            return self.preprocess_batch(data_item)["img"]
 
-        self.model = mtq.quantize(model=self.model, config=config, forward_loop=forward_loop)
+        self.model = nncf.quantize(
+            model=self.model.eval(),
+            calibration_dataset=nncf.Dataset(calib_loader, transform_fn),
+        )
+
+        self.args.dropout = 0  # not compatible with QAT
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Get model and raise NotImplementedError for loading cfg files."""
