@@ -1503,8 +1503,8 @@ def load_checkpoint(weight, device=None, inplace=True, fuse=False):
     args = {**DEFAULT_CFG_DICT, **(ckpt.get("train_args", {}))}  # combine model and default args, preferring model args
     model = ckpt.get("ema") or ckpt["model"]
 
-    if "modelopt_state" in ckpt:  # QAT model
-        import modelopt.torch.opt as mto
+    if "nncf_config" in ckpt:  # QAT model
+        import nncf.torch
 
         # rebuild from YAML
         model = ckpt["model_class"](ckpt["yaml"], verbose=False)
@@ -1513,8 +1513,9 @@ def load_checkpoint(weight, device=None, inplace=True, fuse=False):
         model.yaml = ckpt["yaml"]
         # restore model and QAT weights
         with torch.no_grad():
-            mto.restore_from_modelopt_state(model, ckpt["modelopt_state"])
+            model = nncf.torch.load_from_config(model, ckpt["nncf_config"])
             model.load_state_dict(ckpt["state_dict"])
+        model.is_fused = lambda: True
 
     model = model.float()  # FP32 model
 

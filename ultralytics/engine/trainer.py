@@ -416,7 +416,7 @@ class BaseTrainer:
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    if self.args.compile:
+                    if self.args.compile or self.args.int8:
                         # Decouple inference and loss calculations for improved compile performance
                         preds = self.model(batch["img"])
                         loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
@@ -579,7 +579,7 @@ class BaseTrainer:
         buffer = io.BytesIO()
         model = deepcopy(unwrap_model(self.ema.ema))
         extras = {}
-        if hasattr(model, "_modelopt_state"):
+        if self.args.int8:
             import nncf
 
             extras = {  # model can't be pickled; saving state_dict
@@ -721,15 +721,16 @@ class BaseTrainer:
         import nncf
 
         with torch_distributed_zero_first(LOCAL_RANK):  # init dataset *.cache only once if DDP
-            dataset = self.build_dataset(self.data["val"], "quantize", self.args.batch)
+            dataset = self.build_dataset(self.data["val"], "QAT", self.args.batch)
         calib_loader = build_dataloader(dataset, batch=1, workers=0, drop_last=True)
 
         def transform_fn(data_item):
             return self.preprocess_batch(data_item)["img"]
 
         self.model = nncf.quantize(
-            model=self.model.eval(),
+            model=self.model,
             calibration_dataset=nncf.Dataset(calib_loader, transform_fn),
+            ignored_scope=nncf.IgnoredScope(patterns=["/.*"])
         )
 
         self.args.dropout = 0  # not compatible with QAT

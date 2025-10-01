@@ -460,6 +460,11 @@ class Exporter:
                 # EdgeTPU does not support FlexSplitV while split provides cleaner ONNX graph
                 m.forward = m.forward_split
 
+        self.qat = hasattr(model, "__nncf_hooks")
+        if self.qat:
+            import nncf
+
+            model = nncf.strip(model, example_input=im)
         y = None
         for _ in range(2):  # dry runs
             y = NMSModel(model, self.args)(im) if self.args.nms and not coreml and not imx else model(im)
