@@ -252,21 +252,32 @@ class TaskAlignedAssigner(nn.Module):
         # Assigned target labels, (b, 1)
         batch_ind = torch.arange(end=self.bs, dtype=torch.int64, device=gt_labels.device)[..., None]
         target_gt_idx = target_gt_idx + batch_ind * self.n_max_boxes  # (b, h*w)
-        target_labels = gt_labels.long().flatten()[target_gt_idx]  # (b, h*w)
+
+        # Assigned target scores
+        gt_labels = gt_labels.long()
+        gt_labels.clamp_(0)
+
+        # 10x faster than F.one_hot()
+        target_scores = torch.zeros(
+            (gt_labels.shape[0], gt_labels.shape[1], self.num_classes),
+            dtype=torch.int64,
+            device=gt_labels.device,
+        )  # (b, num_boxes, 80)
+        target_scores.scatter_(2, gt_labels.long(), 1)
+
+        # merge identical boxes class for multi-label
+        for b, bboxes in enumerate(gt_bboxes):
+            _, inv = bboxes.unique(dim=0, return_inverse=True, sorted=False)
+            for i, index in enumerate(inv[1:], start=1):
+                if inv[i-1] == index:
+                    target_scores[b, i] |= target_scores[b, i-1]
+
+        target_scores = target_scores.view(-1, self.num_classes)[target_gt_idx]  # (b, h*w, 80)
 
         # Assigned target boxes, (b, max_num_obj, 4) -> (b, h*w, 4)
         target_bboxes = gt_bboxes.view(-1, gt_bboxes.shape[-1])[target_gt_idx]
 
-        # Assigned target scores
-        target_labels.clamp_(0)
-
-        # 10x faster than F.one_hot()
-        target_scores = torch.zeros(
-            (target_labels.shape[0], target_labels.shape[1], self.num_classes),
-            dtype=torch.int64,
-            device=target_labels.device,
-        )  # (b, h*w, 80)
-        target_scores.scatter_(2, target_labels.unsqueeze(-1), 1)
+        target_labels = gt_labels.view(-1)[target_gt_idx]  # (b, h*w)
 
         fg_scores_mask = fg_mask[:, :, None].repeat(1, 1, self.num_classes)  # (b, h*w, 80)
         target_scores = torch.where(fg_scores_mask > 0, target_scores, 0)
