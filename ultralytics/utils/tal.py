@@ -271,6 +271,7 @@ class TaskAlignedAssigner(nn.Module):
             for i, index in enumerate(inv[1:], start=1):
                 if inv[i-1] == index:
                     target_scores[b, i] |= target_scores[b, i-1]
+                    target_scores[b, i-1] |= target_scores[b, i]
 
         target_scores = target_scores.view(-1, self.num_classes)[target_gt_idx]  # (b, h*w, 80)
 
