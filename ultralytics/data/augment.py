@@ -1757,7 +1757,7 @@ class CopyPaste(BaseMixTransform):
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
         """Apply Copy-Paste augmentation to an image and its labels."""
-        if len(labels["instances"].segments) == 0 or self.p == 0:
+        if self.p == 0:
             return labels
         if self.mode == "flip":
             return self._transform(labels)
@@ -1806,7 +1806,13 @@ class CopyPaste(BaseMixTransform):
         for j in indexes[: round(self.p * n)]:
             cls = np.concatenate((cls, labels2.get("cls", cls)[[j]]), axis=0)
             instances = Instances.concatenate((instances, instances2[[j]]), axis=0)
-            cv2.drawContours(im_new, instances2.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
+            if len(instances.segments) == 0:  # no masks
+                bbox = instances2.bboxes[j]
+                x1, y1, x2, y2 = bbox.astype(int)
+                if (x2 > x1) and (y2 > y1):
+                    im_new[y1:y2, x1:x2] = 1
+            else: # masks
+                cv2.drawContours(im_new, instances2.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
 
         result = labels2.get("img", cv2.flip(im, 1))  # augment segments
         if result.ndim == 2:  # cv2.flip would eliminate the last dimension for grayscale images
