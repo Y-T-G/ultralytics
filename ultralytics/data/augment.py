@@ -1757,7 +1757,7 @@ class CopyPaste(BaseMixTransform):
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
         """Apply Copy-Paste augmentation to an image and its labels."""
-        if len(labels["instances"]) == 0 or self.p == 0:
+        if len(labels["instances"]) == 0 or random.random() > self.p:
             return labels
         if self.mode == "flip":
             return self._transform(labels)
