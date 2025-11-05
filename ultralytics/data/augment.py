@@ -1570,7 +1570,7 @@ class LetterBox:
         new_shape: tuple[int, int] = (640, 640),
         auto: bool = False,
         scale_fill: bool = False,
-        scaleup: bool = True,
+        scaleup: bool = False,
         center: bool = True,
         stride: int = 32,
         padding_value: int = 114,
@@ -1689,7 +1689,7 @@ class LetterBox:
             labels["resized_shape"] = new_shape
             return labels
         else:
-            return img
+            return img if self.scaleup else (img, (ratio, (left, top)))
 
     @staticmethod
     def _update_labels(labels: dict[str, Any], ratio: tuple[float, float], padw: float, padh: float) -> dict[str, Any]:

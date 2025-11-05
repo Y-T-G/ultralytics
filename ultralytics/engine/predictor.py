@@ -197,8 +197,14 @@ class BasePredictor:
             and self.args.rect
             and (self.model.pt or (getattr(self.model, "dynamic", False) and not self.model.imx)),
             stride=self.model.stride,
+            scaleup=self.args.scaleup,
         )
-        return [letterbox(image=x) for x in im]
+        images = [letterbox(image=x) for x in im]
+        if not self.args.scaleup:
+            images, self.pads = zip(*images)
+        else:
+            self.pads = [None] * len(images)
+        return images
 
     def postprocess(self, preds, img, orig_imgs):
         """Post-process predictions for an image and return them."""

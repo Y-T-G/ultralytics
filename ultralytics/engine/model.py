@@ -483,6 +483,7 @@ class Model(torch.nn.Module):
         self,
         source: str | Path | int | Image.Image | list | tuple | np.ndarray | torch.Tensor = None,
         stream: bool = False,
+        scaleup: bool = False,
         predictor=None,
         **kwargs: Any,
     ) -> list[Results]:
@@ -530,6 +531,7 @@ class Model(torch.nn.Module):
 
         if not self.predictor:
             self.predictor = (predictor or self._smart_load("predictor"))(overrides=args, _callbacks=self.callbacks)
+            self.predictor.args.scaleup = scaleup
             self.predictor.setup_model(model=self.model, verbose=is_cli)
         else:  # only update args if predictor is already setup
             self.predictor.args = get_cfg(self.predictor.args, args)
