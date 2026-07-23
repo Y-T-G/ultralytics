@@ -18,33 +18,42 @@
 #   scale  pick            params(fused)  GFLOPs   this   base   margin  runner-up
 #   n      d2 e0.5          2.7M            6.8    3633   3736   -2.8%   d3 e0.5: 3458
 #   s      d3 e0.5         11.0M           28.4    (trained champion, mAP 0.4788 vs 0.4755)
-#   m      d3 e0.28125     19.5M           68.3    1016    987   +2.9%   d2 e0.3125: 1008
+#   m      bb.25/nk.5 d2   22.6M                   1008    965   +4.4%   see m v2 note below
 #   l      d2 e0.3125      24.1M           93.3     801    780   +2.7%   d3 e0.3125: 773 (fails)
 #   x      d3 e0.3125      55.7M          217.2     450    438   +2.7%   d2 e0.375: 397 (fails)
 # n still cannot reach baseline: depth-2 head recovers 5% of the 7.4% gap, the last
 # -2.8% is the strip convs + non-bottleneck rep blocks at tiny width.
+#
+# m v2 (2026-07-23): uniform rep_e=0.28125 h_n=3 trained -0.83 mAP vs yolo26m at ep45
+# (capacity-starved: 144/72ch dense rep everywhere; 72 also breaks mult-of-16). Fix =
+# split bb_e/neck_e like yolo26.yaml (backbone 0.25, neck 0.5): cheap backbone at large
+# spatial, wide dense rep (256/128ch) in the neck where large-object capacity lives.
+# Interleaved bench b16 fp16 GPU7: base 965/995, m-v2 1008 (+4.4%), C3k2-swap variants
+# 970-1009 but less capacity, uniform e0.375 931, bb-rep+C3k2-head-e.375 996.
+# l/x still uniform (bb_e = neck_e); bb/neck split likely helps there too - re-sweep
+# before trusting l/x (x currently training with old constants).
 
 # Parameters
 nc: 80 # number of classes
 end2end: True # whether to use end-to-end mode
 reg_max: 1 # DFL bins
-scale_args: [rep_e, head_n] # names for scales entries beyond [depth, width, max_channels]
+scale_args: [bb_e, neck_e, head_n] # names for scales entries beyond [depth, width, max_channels]
 scales: # model compound scaling constants, i.e. 'model=yolo26n.yaml' will call yolo26.yaml with scale 'n'
-  # [depth, width, max_channels, rep_e, head_n]
-  n: [0.50, 0.25, 1024, 0.5, 2] # best available; still -2.8% vs yolo26n (strip convs + rep blocks dominate at tiny width)
-  s: [0.50, 0.50, 1024, 0.5, 3] # trained champion, do not change
-  m: [0.50, 1.00, 512, 0.28125, 3] # 1016 vs base 987 img/s
-  l: [1.00, 1.00, 512, 0.3125, 2] # 801 vs base 780 img/s
-  x: [1.00, 1.50, 512, 0.3125, 3] # 450 vs base 438 img/s
+  # [depth, width, max_channels, bb_e, neck_e, head_n]
+  n: [0.50, 0.25, 1024, 0.5, 0.5, 2] # best available; still -2.8% vs yolo26n (strip convs + rep blocks dominate at tiny width)
+  s: [0.50, 0.50, 1024, 0.5, 0.5, 3] # trained champion, do not change
+  m: [0.50, 1.00, 512, 0.25, 0.5, 2] # v2: bb_e/neck_e split (yolo26.yaml pattern), 1008 vs base 965 img/s (+4.4%), 22.6M fused
+  l: [1.00, 1.00, 512, 0.3125, 0.3125, 2] # 801 vs base 780 img/s (uniform rep_e; bb/neck split not yet swept)
+  x: [1.00, 1.50, 512, 0.3125, 0.3125, 3] # 450 vs base 438 img/s (uniform rep_e; bb/neck split not yet swept)
 
 # YOLO26n backbone
 backbone:
   # [from, repeats, module, args]
   - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
   - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
-  - [-1, 2, C3k2Rep, [256, False, rep_e]] # 2 - rep block
+  - [-1, 2, C3k2Rep, [256, False, bb_e]] # 2 - rep block
   - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
-  - [-1, 2, C3k2Rep, [512, False, rep_e]] # 4 - rep block
+  - [-1, 2, C3k2Rep, [512, False, bb_e]] # 4 - rep block
   - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
   - [-1, 2, C3k2, [512, True]]
   - [-1, 1, StripAttn, []] # 7 - strip gate at P4
@@ -58,19 +67,19 @@ backbone:
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 7], 1, Concat, [1]]
-  - [-1, head_n, C3k2Rep, [512, True, rep_e]] # 15
+  - [-1, head_n, C3k2Rep, [512, True, neck_e]] # 15
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 4], 1, Concat, [1]]
-  - [-1, head_n, C3k2Rep, [256, True, rep_e]] # 18
+  - [-1, head_n, C3k2Rep, [256, True, neck_e]] # 18
 
   - [-1, 1, Conv, [256, 3, 2]]
   - [[-1, 15], 1, Concat, [1]]
-  - [-1, 2, C3k2Rep, [512, True, rep_e]] # 21
+  - [-1, 2, C3k2Rep, [512, True, neck_e]] # 21
 
   - [-1, 1, Conv, [512, 3, 2]]
   - [[-1, 12], 1, Concat, [1]]
-  - [-1, 2, C3k2Rep, [1024, True, rep_e, True]] # 24
+  - [-1, 2, C3k2Rep, [1024, True, neck_e, True]] # 24
   - [[-1, 12], 1, ScaledAdd, []] # 25: scaled residual from backbone P5
 
   - [[18, 21, 25], 1, Detect, [nc]]
