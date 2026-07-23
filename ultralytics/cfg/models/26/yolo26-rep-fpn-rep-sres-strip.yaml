@@ -30,8 +30,13 @@
 # spatial, wide dense rep (256/128ch) in the neck where large-object capacity lives.
 # Interleaved bench b16 fp16 GPU7: base 965/995, m-v2 1008 (+4.4%), C3k2-swap variants
 # 970-1009 but less capacity, uniform e0.375 931, bb-rep+C3k2-head-e.375 996.
-# l/x still uniform (bb_e = neck_e); bb/neck split likely helps there too - re-sweep
-# before trusting l/x (x currently training with old constants).
+# l/x re-swept with the split (2026-07-23, GPU 4 interleaved, xstrip paused):
+#   l: bb.25/nk.5/d2 = 813 (+3.1%, 29.4M) beats .25/.375/d2 = 854 (+8.3%) on capacity;
+#      uniform .3125 = 804 (24.1M) dominated.
+#   x: bb.25/nk.375/d3 = 455 (+3.7%, 59.0M); nk.5 fails budget (432/-1.6% d2, 409/-6.9% d3);
+#      uniform .3125 = 449 (55.7M) dominated.
+# neck_e=0.4375 is INVALID at l/x: layer-24 PSABlock hidden (224/336ch) not divisible
+# by its head count. Clean neck_e values: 0.375, 0.5.
 
 # Parameters
 nc: 80 # number of classes
@@ -43,8 +48,8 @@ scales: # model compound scaling constants, i.e. 'model=yolo26n.yaml' will call 
   n: [0.50, 0.25, 1024, 0.5, 0.5, 2] # best available; still -2.8% vs yolo26n (strip convs + rep blocks dominate at tiny width)
   s: [0.50, 0.50, 1024, 0.5, 0.5, 3] # trained champion, do not change
   m: [0.50, 1.00, 512, 0.25, 0.5, 2] # v2: bb_e/neck_e split (yolo26.yaml pattern), 1008 vs base 965 img/s (+4.4%), 22.6M fused
-  l: [1.00, 1.00, 512, 0.3125, 0.3125, 2] # 801 vs base 780 img/s (uniform rep_e; bb/neck split not yet swept)
-  x: [1.00, 1.50, 512, 0.3125, 0.3125, 3] # 450 vs base 438 img/s (uniform rep_e; bb/neck split not yet swept)
+  l: [1.00, 1.00, 512, 0.25, 0.5, 2] # v2 split: 813 vs base 789 img/s (+3.1%), 29.4M fused (uniform 0.3125: 804, 24.1M)
+  x: [1.00, 1.50, 512, 0.25, 0.375, 3] # v2 split: 455 vs base 439 img/s (+3.7%), 59.0M fused (uniform 0.3125: 449, 55.7M)
 
 # YOLO26n backbone
 backbone:
