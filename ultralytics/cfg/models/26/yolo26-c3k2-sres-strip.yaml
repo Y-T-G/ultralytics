@@ -16,6 +16,8 @@ reg_max: 1 # DFL bins
 scales: # model compound scaling constants, i.e. 'model=yolo26n.yaml' will call yolo26.yaml with scale 'n'
   # [depth, width, max_channels]
   m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
 
 # YOLO26n backbone
 backbone:
