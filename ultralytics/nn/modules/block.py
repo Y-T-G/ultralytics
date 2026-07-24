@@ -2236,6 +2236,108 @@ class C3k2Rep(C2fRep):
             )
 
 
+class PConv(nn.Module):
+    """Partial convolution (FasterNet, CVPR 2023): dense k x k on a channel slice, identity on the rest."""
+
+    def __init__(self, c: int, k: int = 3, r: float = 0.25):
+        super().__init__()
+        self.cp = int(c * r)
+        self.conv = nn.Conv2d(self.cp, self.cp, k, 1, k // 2, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x.split([self.cp, x.shape[1] - self.cp], 1)
+        return torch.cat((self.conv(x1), x2), 1)
+
+
+class FasterBlock(nn.Module):
+    """FasterNet block (CVPR 2023): PConv spatial mixing + 2-layer pointwise MLP, residual."""
+
+    def __init__(self, c: int, e: float = 2.0):
+        super().__init__()
+        c_ = int(c * e)
+        self.pconv = PConv(c)
+        self.cv1 = Conv(c, c_, 1, 1)
+        self.cv2 = Conv(c_, c, 1, 1, act=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.cv2(self.cv1(self.pconv(x)))
+
+
+class C3k2Faster(C2fRep):
+    """C3k2 with FasterNet PConv blocks instead of RepConv. Same yaml signature as C3k2Rep."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: int = 0,
+        g: int = 1,
+        shortcut: bool = True,
+        identity: bool = True,
+    ):
+        super().__init__(c1, c2, n, shortcut, g, e, identity)
+        if attn:
+            self.m = nn.ModuleList(
+                nn.Sequential(
+                    FasterBlock(self.c),
+                    PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
+                )
+                for _ in range(n)
+            )
+        else:
+            self.m = nn.ModuleList(FasterBlock(self.c) for _ in range(n))
+
+
+class StarBlock(nn.Module):
+    """Star block (StarNet 'Rewrite the Stars', CVPR 2024) with a dense RepConv 3x3 spatial mixer.
+
+    act(f1(y)) * f2(y) lifts features to an implicit high-dimensional space at pointwise cost.
+    """
+
+    def __init__(self, c: int, e: float = 2.0, bn: bool = False, identity: bool = True):
+        super().__init__()
+        c_ = int(c * e)
+        self.conv = RepConv(c, c, bn=bn, identity=identity)
+        self.f1 = nn.Conv2d(c, c_, 1, bias=False)
+        self.f2 = nn.Conv2d(c, c_, 1, bias=False)
+        self.g = Conv(c_, c, 1, 1, act=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.conv(x)
+        return x + self.g(F.relu6(self.f1(y)) * self.f2(y))
+
+
+class C3k2Star(C2fRep):
+    """C3k2 with Star blocks instead of RepConv. Same yaml signature as C3k2Rep."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: int = 0,
+        g: int = 1,
+        shortcut: bool = True,
+        identity: bool = True,
+    ):
+        super().__init__(c1, c2, n, shortcut, g, e, identity)
+        if attn:
+            self.m = nn.ModuleList(
+                nn.Sequential(
+                    StarBlock(self.c, bn=shortcut, identity=identity),
+                    PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
+                )
+                for _ in range(n)
+            )
+        else:
+            self.m = nn.ModuleList(StarBlock(self.c, bn=shortcut, identity=identity) for _ in range(n))
+
+
 class C3k2RepLK(C2fRep):
     """C3k2Rep with additional large-kernel context branch."""
 

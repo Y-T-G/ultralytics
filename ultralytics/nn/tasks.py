@@ -56,6 +56,8 @@ from ultralytics.nn.modules import (
     C3k2RepGhost,
     C3k2Rep,
     C3k2RepLK,
+    C3k2Faster,
+    C3k2Star,
     C3x,
     Add,
     CBFuse,
@@ -1722,6 +1724,8 @@ def parse_model(d, ch, verbose=True):
             C3k2Rep,
             C3k2RepGhost,
             C3k2RepLK,
+            C3k2Faster,
+            C3k2Star,
             RepNCSPELAN4,
             ELAN1,
             ElasticELAN,
@@ -1759,6 +1763,8 @@ def parse_model(d, ch, verbose=True):
             C3k2Rep,
             C3k2RepGhost,
             C3k2RepLK,
+            C3k2Faster,
+            C3k2Star,
             C2fAttn,
             C3,
             C3TR,
@@ -1807,7 +1813,7 @@ def parse_model(d, ch, verbose=True):
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m in {C3k2, C3k2Simple, C3k2AC, C3k2DBB, C3k2MobileOne, C3k2Rep, C3k2RepGhost, C3k2RepLK}:  # for M/L/X sizes
+            if m in {C3k2, C3k2Simple, C3k2AC, C3k2DBB, C3k2MobileOne, C3k2Rep, C3k2RepGhost, C3k2RepLK, C3k2Faster, C3k2Star}:  # for M/L/X sizes
                 legacy = False
                 if scale in "mlx":
                     args[3] = True

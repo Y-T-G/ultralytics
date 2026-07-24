@@ -1,0 +1,55 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Variant of rep-fpn-rep-sres-strip (s scale) with StarNet star-op blocks (CVPR 2024) replacing RepConv
+# inside every C3k2Star site. Same C2f split skeleton and yaml signature; strip
+# gates, sres SPPF/ScaledAdd unchanged. c3k sites use a single StarBlock.
+# Bench (interleaved b16 fp16 GPU7, 2026-07-24): 1650 img/s vs strip 1881 (-12.3%),
+# 11.4M fused. MISSES the speed budget — the two 2x-width pointwise branches and the
+# eltwise product are memory-bound; kept for mAP-per-speed curiosity only.
+
+# Parameters
+nc: 80 # number of classes
+end2end: True # whether to use end-to-end mode
+reg_max: 1 # DFL bins
+scale_args: [bb_e, neck_e, head_n] # names for scales entries beyond [depth, width, max_channels]
+scales: # model compound scaling constants, i.e. 'model=yolo26n.yaml' will call yolo26.yaml with scale 'n'
+  # [depth, width, max_channels, bb_e, neck_e, head_n]
+  s: [0.50, 0.50, 1024, 0.5, 0.5, 3]
+
+# YOLO26n backbone
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C3k2Star, [256, False, bb_e]] # 2 - rep block
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C3k2Star, [512, False, bb_e]] # 4 - rep block
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, StripAttn, []] # 7 - strip gate at P4
+  - [-1, 1, Conv, [1024, 3, 2]] # 8-P5/32
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5, 3, True]] # 10
+  - [-1, 2, C2PSA, [1024]] # 11
+  - [-1, 1, StripAttn, []] # 12 - strip gate at P5
+
+# YOLO26n head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 7], 1, Concat, [1]]
+  - [-1, head_n, C3k2Star, [512, True, neck_e]] # 15
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, head_n, C3k2Star, [256, True, neck_e]] # 18
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 15], 1, Concat, [1]]
+  - [-1, 2, C3k2Star, [512, True, neck_e]] # 21
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]]
+  - [-1, 2, C3k2Star, [1024, True, neck_e, True]] # 24
+  - [[-1, 12], 1, ScaledAdd, []] # 25: scaled residual from backbone P5
+
+  - [[18, 21, 25], 1, Detect, [nc]]
