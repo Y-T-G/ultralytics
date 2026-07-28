@@ -1321,13 +1321,16 @@ class Attention(nn.Module):
         pe (Conv): Convolutional layer for positional encoding.
     """
 
-    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
+    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5, gate: bool = False, decay: bool = False):
         """Initialize multi-head attention module.
 
         Args:
             dim (int): Input dimension.
             num_heads (int): Number of attention heads.
             attn_ratio (float): Attention ratio for key dimension.
+            gate (bool): Sigmoid output gate on the SDPA output computed from the block input
+                (Qwen gated attention, NeurIPS 2025).
+            decay (bool): Per-head Manhattan-distance decay bias on attention logits (RMT MaSA, CVPR 2024).
         """
         super().__init__()
         self.num_heads = num_heads
@@ -1339,6 +1342,20 @@ class Attention(nn.Module):
         self.qkv = Conv(dim, h, 1, act=False)
         self.proj = Conv(dim, dim, 1, act=False)
         self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
+        self.gate = nn.Conv2d(dim, dim, 1) if gate else None
+        if decay:
+            self.register_buffer("log_gamma", (1 - 2.0 ** -torch.linspace(3, 6, num_heads)).log(), persistent=False)
+            self._decay_bias = {}
+        else:
+            self.log_gamma = None
+
+    def _decay(self, H: int, W: int, device, dtype) -> torch.Tensor:
+        key = (H, W, device, dtype)
+        if key not in self._decay_bias:
+            yx = torch.stack(torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij"), -1).view(-1, 2).float()
+            d = (yx[:, None] - yx[None, :]).abs().sum(-1)  # (N, N) Manhattan distance
+            self._decay_bias[key] = (self.log_gamma.view(-1, 1, 1) * d.to(self.log_gamma.device)).to(device, dtype)
+        return self._decay_bias[key]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the Attention module.
@@ -1357,10 +1374,13 @@ class Attention(nn.Module):
         )
 
         attn = (q * self.scale).transpose(-2, -1) @ k  # scale q pre-matmul: fp16-safe, mathematically identical
+        if self.log_gamma is not None:
+            attn = attn + self._decay(H, W, attn.device, attn.dtype)
         attn = attn.softmax(dim=-1)
-        x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
-        x = self.proj(x)
-        return x
+        y = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
+        if self.gate is not None:
+            y = y * torch.sigmoid(self.gate(x))
+        return self.proj(y)
 
 
 class PSABlock(nn.Module):
@@ -1384,7 +1404,9 @@ class PSABlock(nn.Module):
         >>> output_tensor = psablock(input_tensor)
     """
 
-    def __init__(self, c: int, attn_ratio: float = 0.5, num_heads: int = 4, shortcut: bool = True) -> None:
+    def __init__(
+        self, c: int, attn_ratio: float = 0.5, num_heads: int = 4, shortcut: bool = True, gate: bool = False, decay: bool = False
+    ) -> None:
         """Initialize the PSABlock.
 
         Args:
@@ -1392,10 +1414,12 @@ class PSABlock(nn.Module):
             attn_ratio (float): Attention ratio for key dimension.
             num_heads (int): Number of attention heads.
             shortcut (bool): Whether to use shortcut connections.
+            gate (bool): Sigmoid output gate in attention.
+            decay (bool): Manhattan decay bias in attention.
         """
         super().__init__()
 
-        self.attn = Attention(c, attn_ratio=attn_ratio, num_heads=num_heads)
+        self.attn = Attention(c, attn_ratio=attn_ratio, num_heads=num_heads, gate=gate, decay=decay)
         self.ffn = nn.Sequential(Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False))
         self.add = shortcut
 
@@ -1437,7 +1461,7 @@ class C2PSA(nn.Module):
         This module essentially is the same as PSA module, but refactored to allow stacking more PSABlock modules.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5):
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, gate: bool = False, decay: bool = False):
         """Initialize C2PSA module.
 
         Args:
@@ -1445,6 +1469,8 @@ class C2PSA(nn.Module):
             c2 (int): Output channels.
             n (int): Number of PSABlock modules.
             e (float): Expansion ratio.
+            gate (bool): Sigmoid output gate in attention (Qwen gated attention, NeurIPS 2025).
+            decay (bool): Manhattan decay bias on attention logits (RMT MaSA, CVPR 2024).
         """
         super().__init__()
         assert c1 == c2
@@ -1452,7 +1478,9 @@ class C2PSA(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c1, 1)
 
-        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64) for _ in range(n)))
+        self.m = nn.Sequential(
+            *(PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64, gate=gate, decay=decay) for _ in range(n))
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Process the input tensor through a series of PSA blocks.
@@ -2234,6 +2262,42 @@ class C3k2Rep(C2fRep):
                 )
                 for _ in range(n)
             )
+
+
+class AgentAttn(nn.Module):
+    """Agent attention (ECCV 2024): pooled agent tokens bridge softmax and linear attention.
+
+    Agents (pooled queries) attend to all keys, then queries attend to agents — softmax-quality
+    global context at O(N * agents) cost. Residual with DW positional encoding on v, so it can
+    sit at P4/P3 where full self-attention is too expensive.
+    """
+
+    def __init__(self, dim: int, agents: int = 49, attn_ratio: float = 0.5):
+        super().__init__()
+        self.num_heads = max(dim // 64, 1)
+        self.head_dim = dim // self.num_heads
+        self.key_dim = int(self.head_dim * attn_ratio)
+        self.scale = self.key_dim**-0.5
+        self.grid = int(agents**0.5)
+        nh_kd = self.key_dim * self.num_heads
+        self.qkv = Conv(dim, dim + nh_kd * 2, 1, act=False)
+        self.proj = Conv(dim, dim, 1, act=False)
+        self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        N = H * W
+        qkv = self.qkv(x)
+        q, k, v = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N).split(
+            [self.key_dim, self.key_dim, self.head_dim], dim=2
+        )
+        g = self.grid
+        a = F.adaptive_avg_pool2d(q.reshape(B, -1, H, W), (g, g)).view(B, self.num_heads, self.key_dim, g * g)
+        attn1 = ((a * self.scale).transpose(-2, -1) @ k).softmax(dim=-1)  # agents aggregate keys
+        va = v @ attn1.transpose(-2, -1)
+        attn2 = ((q * self.scale).transpose(-2, -1) @ a).softmax(dim=-1)  # queries read agents
+        y = (va @ attn2.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
+        return x + self.proj(y)
 
 
 class PConv(nn.Module):

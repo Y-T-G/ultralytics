@@ -1,0 +1,56 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# strip + sigmoid output gate on C2PSA attention (Qwen gated attention, NeurIPS 2025
+# best paper): Y' = Y * sigmoid(W x) on SDPA output, computed from block input.
+# Also suppresses massive activations / fp16 overflow in attention.
+
+# Parameters
+nc: 80 # number of classes
+end2end: True # whether to use end-to-end mode
+reg_max: 1 # DFL bins
+scale_args: [bb_e, neck_e, head_n] # names for scales entries beyond [depth, width, max_channels]
+scales: # model compound scaling constants, i.e. 'model=yolo26n.yaml' will call yolo26.yaml with scale 'n'
+  # [depth, width, max_channels, bb_e, neck_e, head_n]
+  n: [0.50, 0.25, 1024, 0.5, 0.5, 2] # best available; still -2.8% vs yolo26n (strip convs + rep blocks dominate at tiny width)
+  s: [0.50, 0.50, 1024, 0.5, 0.5, 3] # trained champion, do not change
+  m: [0.50, 1.00, 512, 0.25, 0.5, 2] # v2: bb_e/neck_e split (yolo26.yaml pattern), 1008 vs base 965 img/s (+4.4%), 22.6M fused
+  l: [1.00, 1.00, 512, 0.25, 0.5, 2] # v2 split: 813 vs base 789 img/s (+3.1%), 29.4M fused (uniform 0.3125: 804, 24.1M)
+  x: [1.00, 1.50, 512, 0.25, 0.375, 3] # v2 split: 455 vs base 439 img/s (+3.7%), 59.0M fused (uniform 0.3125: 449, 55.7M)
+
+# YOLO26n backbone
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C3k2Rep, [256, False, bb_e]] # 2 - rep block
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C3k2Rep, [512, False, bb_e]] # 4 - rep block
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, StripAttn, []] # 7 - strip gate at P4
+  - [-1, 1, Conv, [1024, 3, 2]] # 8-P5/32
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5, 3, True]] # 10
+  - [-1, 2, C2PSA, [1024, 0.5, True]] # 11 - gated attention
+  - [-1, 1, StripAttn, []] # 12 - strip gate at P5
+
+# YOLO26n head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 7], 1, Concat, [1]]
+  - [-1, head_n, C3k2Rep, [512, True, neck_e]] # 15
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, head_n, C3k2Rep, [256, True, neck_e]] # 18
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 15], 1, Concat, [1]]
+  - [-1, 2, C3k2Rep, [512, True, neck_e]] # 21
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]]
+  - [-1, 2, C3k2Rep, [1024, True, neck_e, True]] # 24
+  - [[-1, 12], 1, ScaledAdd, []] # 25: scaled residual from backbone P5
+
+  - [[18, 21, 25], 1, Detect, [nc]]

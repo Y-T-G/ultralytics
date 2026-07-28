@@ -58,6 +58,7 @@ from ultralytics.nn.modules import (
     C3k2RepLK,
     C3k2Faster,
     C3k2Star,
+    AgentAttn,
     C3x,
     Add,
     CBFuse,
@@ -1842,7 +1843,7 @@ def parse_model(d, ch, verbose=True):
         elif m is WeightedFusion:
             args[0] = make_divisible(min(args[0], max_channels) * width, 8)
             c2 = args[0]
-        elif m in {StripAttn, GCAttn, GatedUpsample, MogaGate}:
+        elif m in {StripAttn, GCAttn, GatedUpsample, MogaGate, AgentAttn}:
             c2 = ch[f]
             args = [c2, *args]
         elif m is Concat:
