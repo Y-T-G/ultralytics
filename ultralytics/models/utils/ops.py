@@ -5,12 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
+from torch import nn
 
 from ultralytics.utils.metrics import bbox_iou
-from ultralytics.utils.ops import xywh2xyxy, xyxy2xywh
+from ultralytics.utils.ops import linear_sum_assignment, xywh2xyxy, xyxy2xywh
+from .box_ops import pairwise_giou
 
 
 class HungarianMatcher(nn.Module):
@@ -126,11 +126,15 @@ class HungarianMatcher(nn.Module):
         else:
             cost_class = -pred_scores
 
-        # Compute L1 cost between boxes
+        # Compute L1 cost between boxes (keep in original cxcywh space)
         cost_bbox = (pred_bboxes.unsqueeze(1) - gt_bboxes.unsqueeze(0)).abs().sum(-1)  # (bs*num_queries, num_gt)
 
+        # Convert boxes to xyxy for IoU/GIoU computation
+        pred_xyxy = xywh2xyxy(pred_bboxes, clamp_neg=True)
+        gt_xyxy = xywh2xyxy(gt_bboxes, clamp_neg=True)
+
         # Compute GIoU cost between boxes, (bs*num_queries, num_gt)
-        cost_giou = 1.0 - bbox_iou(pred_bboxes.unsqueeze(1), gt_bboxes.unsqueeze(0), xywh=True, GIoU=True).squeeze(-1)
+        cost_giou = 1.0 - pairwise_giou(pred_xyxy, gt_xyxy)
 
         # Combine costs into final cost matrix
         C = (
@@ -143,10 +147,9 @@ class HungarianMatcher(nn.Module):
         if self.with_mask:
             C += self._cost_mask(bs, gt_groups, masks, gt_mask)
 
-        # Set invalid values (NaNs and infinities) to 0
-        C[C.isnan() | C.isinf()] = 0.0
-
         C = C.view(bs, nq, -1).cpu()
+        # Replace NaNs with large cost so they are avoided by the matcher
+        C = torch.nan_to_num(C, nan=1.0)
         indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(gt_groups, -1))]
         gt_groups = torch.as_tensor([0, *gt_groups[:-1]]).cumsum_(0)  # (idx for queries, idx for gt)
         return [
@@ -201,9 +204,9 @@ def get_cdn_group(
     boxes and class labels. It generates both positive and negative samples to improve model robustness.
 
     Args:
-        batch (dict[str, Any]): Batch dictionary containing 'gt_cls' (torch.Tensor with shape (num_gts,)), 'gt_bboxes'
-            (torch.Tensor with shape (num_gts, 4)), and 'gt_groups' (list[int]) indicating number of ground truths
-            per image.
+        batch (dict[str, Any]): Batch dictionary containing 'cls' (torch.Tensor with shape (num_gts,)), 'bboxes'
+            (torch.Tensor with shape (num_gts, 4)), 'batch_idx' (torch.Tensor), and 'gt_groups' (list[int]) indicating
+            number of ground truths per image.
         num_classes (int): Total number of object classes.
         num_queries (int): Number of object queries.
         class_embed (torch.Tensor): Class embedding weights to map labels to embedding space.

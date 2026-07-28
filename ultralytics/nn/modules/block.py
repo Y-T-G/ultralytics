@@ -1374,11 +1374,11 @@ class Attention(nn.Module):
         )
 
         attn = (q * self.scale).transpose(-2, -1) @ k  # scale q pre-matmul: fp16-safe, mathematically identical
-        if self.log_gamma is not None:
+        if getattr(self, "log_gamma", None) is not None:
             attn = attn + self._decay(H, W, attn.device, attn.dtype)
         attn = attn.softmax(dim=-1)
         y = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
-        if self.gate is not None:
+        if getattr(self, "gate", None) is not None:
             y = y * torch.sigmoid(self.gate(x))
         return self.proj(y)
 

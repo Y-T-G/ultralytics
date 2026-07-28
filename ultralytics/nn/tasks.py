@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import contextlib
+import json
 import pickle
 import re
 import types
@@ -108,6 +109,7 @@ from ultralytics.nn.modules import (
     RepVGGDW,
     ResNetLayer,
     RTDETRDecoder,
+    RTDETRDecoderEfficient,
     SCDown,
     Segment,
     Segment26,
@@ -958,6 +960,144 @@ class RTDETRDetectionModel(DetectionModel):
         return x
 
 
+class YOLODETRDetectionModel(RTDETRDetectionModel):
+    """YOLO-DETR detection model with DfineLoss dispatch for DEIM and RTDETRDecoderEfficient heads.
+
+    Inherits from RTDETRDetectionModel and overrides ``init_criterion`` and ``loss`` to route DETR heads through
+    ``DfineLoss``. The DEIM head uses the full FGL + DDF terms; ``RTDETRDecoderEfficient`` reuses the same constants but
+    with FGL/DDF gains zeroed and union-set matching off, since it emits no ``pred_corners`` / pre-stage tensors. The
+    parent ``RTDETRDecoder`` head still falls through to ``RTDETRDetectionLoss`` via super.
+    """
+
+    # Hardcoded DfineLoss constants.
+    _DFINE_LOSS_CONSTANTS = {
+        "reg_max": 32,
+        "gamma": 1.5,
+        "alpha": 0.75,
+        "use_fl": False,
+        "use_vfl": False,
+        "use_mal": True,
+        "use_union_set": True,
+        "loss_gain": {"class": 1, "bbox": 5, "giou": 2, "fgl": 0.15, "ddf": 1.5},
+        "matcher": {"cost_gain": {"class": 2, "bbox": 5, "giou": 2}, "use_fl": True, "alpha": 0.25, "gamma": 2.0},
+    }
+
+    def init_criterion(self):
+        """Initialize the loss criterion, dispatching to DfineLoss for DEIM and RTDETRDecoderEfficient heads."""
+        head_name = type(self.model[-1]).__name__
+        if head_name == "DeimDecoder":
+            from ultralytics.models.utils.loss_dfine import DfineLoss
+
+            return DfineLoss(nc=self.nc, **self._DFINE_LOSS_CONSTANTS)
+        if head_name == "RTDETRDecoderEfficient":
+            from ultralytics.models.utils.loss_dfine import DfineLoss
+
+            efficient_kwargs = {
+                **self._DFINE_LOSS_CONSTANTS,
+                "use_union_set": False,
+                "loss_gain": {**self._DFINE_LOSS_CONSTANTS["loss_gain"], "fgl": 0.0, "ddf": 0.0},
+            }
+            return DfineLoss(nc=self.nc, **efficient_kwargs)
+        return super().init_criterion()
+
+    @staticmethod
+    def _split_dfine_meta(dfine_meta, dn_meta):
+        """Split dfine_meta tensors along the query dim into dn and o2o portions for DfineLoss."""
+        if dn_meta is None:
+            return dfine_meta
+        dn_num = dn_meta["dn_num_split"][0]
+
+        def split_layered(t):
+            return (t[:, :, :dn_num], t[:, :, dn_num:]) if t is not None else (None, None)
+
+        def split_flat(t):
+            return (t[:, :dn_num], t[:, dn_num:]) if t is not None else (None, None)
+
+        dn_corners, o2o_corners = split_layered(dfine_meta.get("pred_corners"))
+        dn_refs, o2o_refs = split_layered(dfine_meta.get("ref_points"))
+        dn_pre_bboxes, o2o_pre_bboxes = split_flat(dfine_meta.get("pre_bboxes"))
+        dn_pre_logits, o2o_pre_logits = split_flat(dfine_meta.get("pre_logits"))
+
+        out = {
+            "up": dfine_meta.get("up"),
+            "reg_scale": dfine_meta.get("reg_scale"),
+            "pred_corners": o2o_corners,
+            "ref_points": o2o_refs,
+            "pre_bboxes": o2o_pre_bboxes,
+            "pre_logits": o2o_pre_logits,
+        }
+        if dn_corners is not None:
+            out["dn_pred_corners"] = dn_corners
+            out["dn_ref_points"] = dn_refs
+            out["dn_pre_bboxes"] = dn_pre_bboxes
+            out["dn_pre_logits"] = dn_pre_logits
+        return out
+
+    def loss(self, batch, preds=None):
+        """Compute loss with DfineLoss dispatch and dynamic loss-name return tuple for FGL/DDF logging.
+
+        Args:
+            batch (dict): Dictionary containing image and label data.
+            preds (tuple, optional): Precomputed model predictions.
+
+        Returns:
+            (torch.Tensor): Total loss value.
+            (dict): Name-keyed loss components (giou/cls/l1, plus fgl/ddf when DfineLoss is active).
+        """
+        if not hasattr(self, "criterion"):
+            self.criterion = self.init_criterion()
+
+        img = batch["img"]
+        bs = img.shape[0]
+        batch_idx = batch["batch_idx"]
+        gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
+        targets = {
+            "cls": batch["cls"].to(img.device, dtype=torch.long).view(-1),
+            "bboxes": batch["bboxes"].to(device=img.device),
+            "batch_idx": batch_idx.to(img.device, dtype=torch.long).view(-1),
+            "gt_groups": gt_groups,
+        }
+
+        if preds is None:
+            preds = self.predict(img, batch=targets)
+        pred_tuple = preds if self.training else preds[1]
+        dfine_meta = None
+        if len(pred_tuple) == 6:
+            dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta, dfine_meta = pred_tuple
+        else:
+            dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = pred_tuple
+
+        if dn_meta is None:
+            dn_bboxes, dn_scores = None, None
+        else:
+            dn_bboxes, dec_bboxes = torch.split(dec_bboxes, dn_meta["dn_num_split"], dim=2)
+            dn_scores, dec_scores = torch.split(dec_scores, dn_meta["dn_num_split"], dim=2)
+
+        supports_dfine = getattr(self.criterion, "supports_dfine", False)
+        if supports_dfine and dfine_meta is not None:
+            dfine_meta = self._split_dfine_meta(dfine_meta, dn_meta)
+
+        dec_bboxes = torch.cat([enc_bboxes.unsqueeze(0), dec_bboxes])
+        dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
+
+        loss_kwargs = {"dn_bboxes": dn_bboxes, "dn_scores": dn_scores, "dn_meta": dn_meta}
+        if supports_dfine:
+            loss_kwargs["dfine_meta"] = dfine_meta
+        loss = self.criterion((dec_bboxes, dec_scores), targets, **loss_kwargs)
+
+        # NOTE: backward with all losses but only log the main three (+ FGL/DDF when DfineLoss is active).
+        loss_items = {
+            "giou_loss": loss["loss_giou"].detach(),
+            "cls_loss": loss["loss_class"].detach(),
+            "l1_loss": loss["loss_bbox"].detach(),
+        }
+        if supports_dfine and dfine_meta is not None:
+            loss_items["fgl_loss"] = loss["loss_fgl"].detach()
+            loss_items["ddf_loss"] = loss["loss_ddf"].detach()
+        return sum(loss.values()), loss_items
+
+
+
 class WorldModel(DetectionModel):
     """YOLOv8 World Model.
 
@@ -1681,6 +1821,9 @@ def parse_model(d, ch, verbose=True):
         # Optional extra scaling constants: `scale_args: [rep_e, ...]` names scales entries 4+, and
         # module args may reference them by name, e.g. [-1, 2, C3k2Rep, [256, False, rep_e]]
         scale_consts = dict(zip(d.get("scale_args", []), vals[3:]))
+    if isinstance(d.get("scale_args"), dict) and scale:
+        # Per-scale dict form: `scale_args: {n: {ndl: 4, efficient_ms: True}}`, see yolo27-detr.yaml
+        scale_consts.update(d["scale_args"].get(scale) or {})
 
     if act:
         Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = torch.nn.SiLU()
@@ -1908,7 +2051,7 @@ def parse_model(d, ch, verbose=True):
             args.append([ch[x] for x in f])
         elif m is ImagePoolingAttn:
             args.insert(1, [ch[x] for x in f])  # channels as second arg
-        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
+        elif m in {RTDETRDecoder, RTDETRDecoderEfficient}:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
         elif m is CBLinear:
             c2 = args[0]
@@ -2051,3 +2194,58 @@ def guess_model_task(model):
         "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'."
     )
     return "detect"  # assume detect
+
+def guess_model_family(model):
+    """Guess specialized model family for wrapper selection."""
+
+    def head2family(head_name: str):
+        head = head_name.lower()
+        if head in {"deimdecoder", "rtdetrdecoderefficient"}:
+            return "yolodetr"
+        if head == "rtdetrdecoder":
+            return "rtdetr"
+        return None
+
+    def metadata2family(metadata: dict):
+        model_type = str(metadata.get("model_type", "")).lower().replace("-", "")
+        if model_type in {"yolodetr", "rtdetr"}:
+            return model_type
+        return head2family(str(metadata.get("head", "")))
+
+    if isinstance(model, torch.nn.Module):
+        with contextlib.suppress(Exception):
+            return head2family(model.model[-1].__class__.__name__)
+
+    if isinstance(model, (str, Path)):
+        path = Path(model)
+        stem = re.sub(r"[^a-z0-9]+", "", path.stem.lower())
+        # Route any YOLO-DETR checkpoint/export to the YOLO-DETR family by name, across all scales and formats
+        # (incl. .engine), e.g. yolo27n-detr / yolo27x-detr / yolo27xxl-detr -> yolo27<scale>detr. This takes priority
+        # over embedded metadata so engines route here too (the exporter stamps model_type="rtdetr" for every
+        # RTDETRDecoder subclass, which would otherwise send RTDETRDecoderEfficient engines to RT-DETR).
+        if "yolodetr" in stem or re.search(r"yolo\d+[a-z]*detr", stem):
+            return "yolodetr"
+
+        family = metadata2family(_load_export_metadata(path))
+        if family:
+            return family
+        if "rtdetr" in stem:
+            return "rtdetr"
+
+    return None
+
+
+
+def _load_export_metadata(path: Path) -> dict:
+    """Load lightweight metadata from exported model files without backend dependencies."""
+    if path.suffix != ".engine" or not path.is_file():
+        return {}
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            meta_len = int.from_bytes(f.read(4), byteorder="little", signed=True)
+            if meta_len <= 0 or meta_len > size - 4:
+                return {}
+            return json.loads(f.read(meta_len).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}

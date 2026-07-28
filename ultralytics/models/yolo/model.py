@@ -19,6 +19,7 @@ from ultralytics.nn.tasks import (
     WorldModel,
     YOLOEModel,
     YOLOESegModel,
+    guess_model_family,
 )
 from ultralytics.utils import ROOT, YAML
 
@@ -63,7 +64,20 @@ class YOLO(Model):
             verbose (bool): Display model info on load.
         """
         path = Path(model if isinstance(model, (str, Path)) else "")
-        if "-world" in path.stem and path.suffix in {".pt", ".yaml", ".yml"}:  # if YOLOWorld PyTorch model
+        family = guess_model_family(path)
+        if family == "yolodetr":
+            from ultralytics import YOLODETR
+
+            new_instance = YOLODETR(path)
+            self.__class__ = type(new_instance)
+            self.__dict__ = new_instance.__dict__
+        elif family == "rtdetr":
+            from ultralytics import RTDETR
+
+            new_instance = RTDETR(path)
+            self.__class__ = type(new_instance)
+            self.__dict__ = new_instance.__dict__
+        elif "-world" in path.stem and path.suffix in {".pt", ".yaml", ".yml"}:  # if YOLOWorld PyTorch model
             new_instance = YOLOWorld(path, verbose=verbose)
             self.__class__ = type(new_instance)
             self.__dict__ = new_instance.__dict__
@@ -74,12 +88,22 @@ class YOLO(Model):
         else:
             # Continue with default YOLO initialization
             super().__init__(model=model, task=task, verbose=verbose)
-            if hasattr(self.model, "model") and "RTDETR" in self.model.model[-1]._get_name():  # if RTDETR head
-                from ultralytics import RTDETR
+            if hasattr(self.model, "model"):
+                head_name = self.model.model[-1]._get_name()
+                # YOLO-DETR family check must precede the broad "RTDETR in head_name" substring match
+                # since "RTDETRDecoderEfficient" would otherwise be routed to RTDETR.
+                if head_name in {"DeimDecoder", "RTDETRDecoderEfficient"}:  # YOLO-DETR head
+                    from ultralytics import YOLODETR
 
-                new_instance = RTDETR(self)
-                self.__class__ = type(new_instance)
-                self.__dict__ = new_instance.__dict__
+                    new_instance = YOLODETR(self)
+                    self.__class__ = type(new_instance)
+                    self.__dict__ = new_instance.__dict__
+                elif "RTDETR" in head_name:  # if RTDETR head
+                    from ultralytics import RTDETR
+
+                    new_instance = RTDETR(self)
+                    self.__class__ = type(new_instance)
+                    self.__dict__ = new_instance.__dict__
 
     def timeit(self, imgsz=640, loops=100, runs=7):
         """Benchmark forward pass with timeit (100 loops x 7 runs)."""

@@ -6,8 +6,8 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils.torch_utils import TORCH_1_11
@@ -54,7 +54,7 @@ class TransformerEncoderLayer(nn.Module):
         cm: int = 2048,
         num_heads: int = 8,
         dropout: float = 0.0,
-        act: nn.Module = nn.GELU(),
+        act: nn.Module | None = None,
         normalize_before: bool = False,
     ):
         """Initialize the TransformerEncoderLayer with specified parameters.
@@ -85,7 +85,7 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-        self.act = act
+        self.act = nn.GELU() if act is None else act
         self.normalize_before = normalize_before
 
     @staticmethod
@@ -181,7 +181,7 @@ class AIFI(TransformerEncoderLayer):
         cm: int = 2048,
         num_heads: int = 8,
         dropout: float = 0,
-        act: nn.Module = nn.GELU(),
+        act: nn.Module | None = None,
         normalize_before: bool = False,
     ):
         """Initialize the AIFI instance with specified parameters.
@@ -206,14 +206,14 @@ class AIFI(TransformerEncoderLayer):
             (torch.Tensor): Output tensor with shape [B, C, H, W].
         """
         c, h, w = x.shape[1:]
-        pos_embed = self.build_2d_sincos_position_embedding(w, h, c)
+        pos_embed = self.build_2d_sincos_position_embedding(w, h, c, device=x.device)
         # Flatten [B, C, H, W] to [B, HxW, C]
         x = super().forward(x.flatten(2).permute(0, 2, 1), pos=pos_embed.to(device=x.device, dtype=x.dtype))
         return x.permute(0, 2, 1).view([-1, c, h, w]).contiguous()
 
     @staticmethod
     def build_2d_sincos_position_embedding(
-        w: int, h: int, embed_dim: int = 256, temperature: float = 10000.0
+        w: int, h: int, embed_dim: int = 256, temperature: float = 10000.0, device=None
     ) -> torch.Tensor:
         """Build 2D sine-cosine position embedding.
 
@@ -222,20 +222,24 @@ class AIFI(TransformerEncoderLayer):
             h (int): Height of the feature map.
             embed_dim (int): Embedding dimension.
             temperature (float): Temperature for the sine/cosine functions.
+            device (torch.device, optional): Device on which to build the embedding grids.
 
         Returns:
-            (torch.Tensor): Position embedding with shape [1, embed_dim, h*w].
+            (torch.Tensor): Position embedding with shape [1, h*w, embed_dim].
         """
         assert embed_dim % 4 == 0, "Embed dimension must be divisible by 4 for 2D sin-cos position embedding"
-        grid_w = torch.arange(w, dtype=torch.float32)
-        grid_h = torch.arange(h, dtype=torch.float32)
+        # Build on the input's device so a traced graph doesn't bake a CPU `arange` that clashes with GPU activations
+        # (e.g. TorchScript export of RT-DETR: the traced `arange` is pinned to CPU and fails GPU inference).
+        grid_w = torch.arange(w, dtype=torch.float32, device=device)
+        grid_h = torch.arange(h, dtype=torch.float32, device=device)
         grid_w, grid_h = torch.meshgrid(grid_w, grid_h, indexing="ij") if TORCH_1_11 else torch.meshgrid(grid_w, grid_h)
         pos_dim = embed_dim // 4
-        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+        omega = torch.arange(pos_dim, dtype=torch.float32, device=device) / pos_dim
         omega = 1.0 / (temperature**omega)
 
-        out_w = grid_w.flatten()[..., None] @ omega[None]
-        out_h = grid_h.flatten()[..., None] @ omega[None]
+        # Pin matmul to fp32 for CoreML export: fp16 sin/cos on integer-derived positions accumulates visible error.
+        out_w = grid_w.flatten()[..., None].float() @ omega[None]
+        out_h = grid_h.flatten()[..., None].float() @ omega[None]
 
         return torch.cat([torch.sin(out_w), torch.cos(out_w), torch.sin(out_h), torch.cos(out_h)], 1)[None]
 
@@ -326,7 +330,7 @@ class MLPBlock(nn.Module):
         Args:
             embedding_dim (int): Input and output dimension.
             mlp_dim (int): Hidden dimension.
-            act (nn.Module): Activation function.
+            act (type): Activation function class.
         """
         super().__init__()
         self.lin1 = nn.Linear(embedding_dim, mlp_dim)
@@ -376,7 +380,7 @@ class MLP(nn.Module):
             hidden_dim (int): Hidden dimension.
             output_dim (int): Output dimension.
             num_layers (int): Number of layers.
-            act (nn.Module): Activation function.
+            act (type): Activation function class.
             sigmoid (bool): Whether to apply sigmoid to the output.
             residual (bool): Whether to use residual connections.
             out_norm (nn.Module, optional): Normalization layer for the output.
@@ -386,7 +390,7 @@ class MLP(nn.Module):
         h = [hidden_dim] * (num_layers - 1)
         self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim, *h], [*h, output_dim]))
         self.sigmoid = sigmoid
-        self.act = act()
+        self.act = act if isinstance(act, nn.Module) else act()
         if residual and input_dim != output_dim:
             raise ValueError("residual is only supported if input_dim == output_dim")
         self.residual = residual
@@ -539,12 +543,12 @@ class MSDeformAttn(nn.Module):
 
         Args:
             query (torch.Tensor): Query tensor with shape [bs, query_length, C].
-            refer_bbox (torch.Tensor): Reference bounding boxes with shape [bs, query_length, n_levels, 2], range in [0,
-                1], top-left (0,0), bottom-right (1, 1), including padding area.
+            refer_bbox (torch.Tensor): Reference bounding boxes with shape [bs, query_length, 1, 2 or 4], range in [0,
+                1], top-left (0,0), bottom-right (1, 1). The size-1 axis broadcasts across n_levels.
             value (torch.Tensor): Value tensor with shape [bs, value_length, C].
             value_shapes (list): List with shape [n_levels, 2], [(H_0, W_0), (H_1, W_1), ..., (H_{L-1}, W_{L-1})].
-            value_mask (torch.Tensor, optional): Mask tensor with shape [bs, value_length], True for non-padding
-                elements, False for padding elements.
+            value_mask (torch.Tensor, optional): Mask tensor with shape [bs, value_length], True for padding elements,
+                False for non-padding elements.
 
         Returns:
             (torch.Tensor): Output tensor with shape [bs, Length_{query}, C].
@@ -560,18 +564,21 @@ class MSDeformAttn(nn.Module):
         if value_mask is not None:
             value = value.masked_fill(value_mask[..., None], float(0))
         value = value.view(bs, len_v, self.n_heads, self.d_model // self.n_heads)
-        sampling_offsets = self.sampling_offsets(query).view(bs, len_q, self.n_heads, self.n_levels, self.n_points, 2)
-        attention_weights = self.attention_weights(query).view(bs, len_q, self.n_heads, self.n_levels * self.n_points)
-        attention_weights = F.softmax(attention_weights, -1).view(bs, len_q, self.n_heads, self.n_levels, self.n_points)
-        # N, Len_q, n_heads, n_levels, n_points, 2
+        # Fold (n_levels, n_points) into one axis so every traced tensor stays at rank <= 5 (required for CoreML
+        # export); refer_bbox arrives as (bs, len_q, 1, 2 or 4) and its size-1 axis broadcasts implicitly.
+        n_total_points = self.n_levels * self.n_points
+        sampling_offsets = self.sampling_offsets(query).view(bs, len_q, self.n_heads, n_total_points, 2)
+        attention_weights = self.attention_weights(query).view(bs, len_q, self.n_heads, n_total_points)
+        attention_weights = F.softmax(attention_weights, -1)
         num_points = refer_bbox.shape[-1]
         if num_points == 2:
             offset_normalizer = torch.as_tensor(value_shapes, dtype=query.dtype, device=query.device).flip(-1)
-            add = sampling_offsets / offset_normalizer[None, None, None, :, None, :]
-            sampling_locations = refer_bbox[:, :, None, :, None, :] + add
+            offset_normalizer = offset_normalizer[:, None, :].expand(-1, self.n_points, -1).reshape(n_total_points, 2)
+            sampling_locations = refer_bbox[:, :, None, :, :] + sampling_offsets / offset_normalizer
         elif num_points == 4:
-            add = sampling_offsets / self.n_points * refer_bbox[:, :, None, :, None, 2:] * 0.5
-            sampling_locations = refer_bbox[:, :, None, :, None, :2] + add
+            sampling_locations = (
+                refer_bbox[:, :, None, :, :2] + sampling_offsets / self.n_points * refer_bbox[:, :, None, :, 2:] * 0.5
+            )
         else:
             raise ValueError(f"Last dim of reference_points must be 2 or 4, but got {num_points}.")
         output = multi_scale_deformable_attn_pytorch(value, value_shapes, sampling_locations, attention_weights)
@@ -609,7 +616,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         n_heads: int = 8,
         d_ffn: int = 1024,
         dropout: float = 0.0,
-        act: nn.Module = nn.ReLU(),
+        act: nn.Module | None = None,
         n_levels: int = 4,
         n_points: int = 4,
     ):
@@ -638,7 +645,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         # FFN
         self.linear1 = nn.Linear(d_model, d_ffn)
-        self.act = act
+        self.act = nn.ReLU() if act is None else act
         self.dropout3 = nn.Dropout(dropout)
         self.linear2 = nn.Linear(d_ffn, d_model)
         self.dropout4 = nn.Dropout(dropout)
@@ -721,7 +728,15 @@ class DeformableTransformerDecoder(nn.Module):
         https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/transformers/deformable_transformer.py
     """
 
-    def __init__(self, hidden_dim: int, decoder_layer: nn.Module, num_layers: int, eval_idx: int = -1):
+    def __init__(
+        self,
+        hidden_dim: int,
+        decoder_layer: nn.Module,
+        num_layers: int,
+        eval_idx: int = -1,
+        efficient_ms: bool = False,
+        fixed_query_pos: bool = False,
+    ):
         """Initialize the DeformableTransformerDecoder with the given parameters.
 
         Args:
@@ -729,12 +744,27 @@ class DeformableTransformerDecoder(nn.Module):
             decoder_layer (nn.Module): Decoder layer module.
             num_layers (int): Number of decoder layers.
             eval_idx (int): Index of the layer to use during evaluation.
+            efficient_ms (bool): If True, layer `i` attends only to level `order[i % n_levels]` (smallest first,
+                round-robin). The per-layer scale is fixed by index, so `num_layers` can change at inference without
+                shifting assignments. Cross-attention must use `n_levels=1`.
+            fixed_query_pos (bool): If True, compute `pos_mlp(refer_bbox)` once from the initial reference and reuse
+                across all decoder layers instead of recomputing after every bbox refinement.
         """
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
+        self.efficient_ms = efficient_ms
+        self.fixed_query_pos = fixed_query_pos
+
+    def __setstate__(self, state):
+        """Backfill `efficient_ms` / `fixed_query_pos` for pickles saved before these flags were added."""
+        self.__dict__.update(state)
+        if "efficient_ms" not in self.__dict__:
+            self.efficient_ms = False
+        if "fixed_query_pos" not in self.__dict__:
+            self.fixed_query_pos = False
 
     def forward(
         self,
@@ -770,8 +800,34 @@ class DeformableTransformerDecoder(nn.Module):
         dec_cls = []
         last_refined_bbox = None
         refer_bbox = refer_bbox.sigmoid()
+
+        # Round-robin schedule: layer i attends to level order[i % n_levels], smallest first.
+        # Assignments repeat every n_levels layers, so num_layers can vary at inference (e.g.
+        # early-exit) without shifting per-layer assignments.
+        if self.efficient_ms:
+            n_levels = len(shapes)
+            level_sizes = [h * w for h, w in shapes]
+            level_starts = [0]
+            for s in level_sizes[:-1]:
+                level_starts.append(level_starts[-1] + s)
+            order = sorted(range(n_levels), key=lambda j: level_sizes[j])
+
+        # Hoist query_pos out of the loop when fixed: compute once from the initial refer_bbox and reuse.
+        query_pos_fixed = pos_mlp(refer_bbox) if self.fixed_query_pos else None
+
         for i, layer in enumerate(self.layers):
-            output = layer(output, refer_bbox, feats, shapes, padding_mask, attn_mask, pos_mlp(refer_bbox))
+            if self.efficient_ms:
+                lv = order[i % n_levels]
+                start = level_starts[lv]
+                end = start + level_sizes[lv]
+                feats_i = feats[:, start:end]
+                shapes_i = [shapes[lv]]
+                pmask_i = padding_mask[:, start:end] if padding_mask is not None else None
+            else:
+                feats_i, shapes_i, pmask_i = feats, shapes, padding_mask
+
+            query_pos = query_pos_fixed if query_pos_fixed is not None else pos_mlp(refer_bbox)
+            output = layer(output, refer_bbox, feats_i, shapes_i, pmask_i, attn_mask, query_pos)
 
             bbox = bbox_head[i](output)
             refined_bbox = torch.sigmoid(bbox + inverse_sigmoid(refer_bbox))
