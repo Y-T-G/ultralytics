@@ -130,6 +130,8 @@ from ultralytics.nn.modules import (
     YOLOESegment26,
     v10Detect,
 )
+from ultralytics.nn.modules.block import RepNCSPELAN5
+from ultralytics.nn.modules.vit_blocks import ConvSyncBN, VITBlock, VITDownsample2x, VITPatchStem, VITTokenToSpatial
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, SETTINGS, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -1892,6 +1894,7 @@ def parse_model(d, ch, verbose=True):
         {
             Classify,
             Conv,
+            ConvSyncBN,
             ConvTranspose,
             GhostConv,
             MobileOneConv,
@@ -1925,6 +1928,7 @@ def parse_model(d, ch, verbose=True):
             C3k2Faster,
             C3k2Star,
             RepNCSPELAN4,
+            RepNCSPELAN5,
             ELAN1,
             ElasticELAN,
             ADown,
@@ -2023,6 +2027,13 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m in frozenset({AIFI, UltraViTBlock, FastViTBlock, MHSABlock}):
             args = [ch[f], *args]
+        elif m in frozenset({VITBlock, VITTokenToSpatial}):
+            args = [ch[f], *args]
+        elif m is VITPatchStem:
+            args = [ch[f], *args]
+            c2 = args[1]
+        elif m is VITDownsample2x:
+            c2 = ch[f]
         elif m in frozenset({HGStem, HGBlock}):
             c1 = ch[f]
             cm = make_divisible(min(args[0], max_channels) * width, 8)

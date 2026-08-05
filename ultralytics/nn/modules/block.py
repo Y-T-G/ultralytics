@@ -1613,7 +1613,7 @@ class SCDown(nn.Module):
         torch.Size([1, 128, 64, 64])
     """
 
-    def __init__(self, c1: int, c2: int, k: int, s: int):
+    def __init__(self, c1: int, c2: int, k: int, s: int, act: bool = True):
         """Initialize SCDown module.
 
         Args:
@@ -1621,9 +1621,10 @@ class SCDown(nn.Module):
             c2 (int): Output channels.
             k (int): Kernel size.
             s (int): Stride.
+            act (bool): Activation on the pointwise conv.
         """
         super().__init__()
-        self.cv1 = Conv(c1, c2, 1, 1)
+        self.cv1 = Conv(c1, c2, 1, 1, act=act)
         self.cv2 = Conv(c2, c2, k=k, s=s, g=c2, act=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

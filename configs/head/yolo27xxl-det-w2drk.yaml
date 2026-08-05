@@ -1,0 +1,199 @@
+nc: 80
+scale: x
+channels: 3
+end2end: true
+head_c2: 192
+fixed_c3: 384
+box_dilated: 9
+module: {init: 'from ultralytics.nn.modules.vit_blocks import ConvSyncBN, VITBlock,
+    VITDownsample2x, VITPatchStem, VITTokenToSpatial
+
+    from ultralytics.nn.modules.block import RepNCSPELAN5
+
+    '}
+backbone:
+- - -1
+  - 1
+  - nn.Identity
+  - []
+- - -1
+  - 1
+  - VITPatchStem
+  - [768, 16, 4]
+- - -1
+  - 5
+  - VITBlock
+  - [12, 4, mlp, 1.0e-05]
+- - -1
+  - 1
+  - VITBlock
+  - [12, 4, mlp, 1.0e-05]
+- - -1
+  - 2
+  - VITBlock
+  - [12, 4, mlp, 1.0e-05]
+- - -1
+  - 1
+  - VITBlock
+  - [12, 4, mlp, 1.0e-05]
+- - -1
+  - 2
+  - VITBlock
+  - [12, 4, mlp, 1.0e-05]
+- - -1
+  - 1
+  - VITBlock
+  - [12, 4, mlp, 1.0e-05]
+- - 3
+  - 1
+  - VITTokenToSpatial
+  - [4]
+- - 5
+  - 1
+  - VITTokenToSpatial
+  - [4]
+- - 7
+  - 1
+  - VITTokenToSpatial
+  - [4]
+- - 8
+  - 1
+  - nn.Upsample
+  - [None, 2, bilinear]
+- - 10
+  - 1
+  - VITDownsample2x
+  - []
+- - 0
+  - 1
+  - ConvSyncBN
+  - [96, 3, 2, None, 1, 1, false]
+- - -1
+  - 1
+  - nn.GELU
+  - []
+- - -1
+  - 1
+  - nn.MaxPool2d
+  - [3, 2, 1]
+- - -1
+  - 1
+  - ConvSyncBN
+  - [192, 3, 2, None, 1, 1, false]
+- - -1
+  - 1
+  - nn.GELU
+  - []
+- - -1
+  - 1
+  - ConvSyncBN
+  - [384, 3, 2, None, 1, 1, false]
+- - -1
+  - 1
+  - nn.GELU
+  - []
+- - -1
+  - 1
+  - ConvSyncBN
+  - [384, 3, 2, None, 1, 1, false]
+- - [11, 16]
+  - 1
+  - Concat
+  - [1]
+- - -1
+  - 1
+  - ConvSyncBN
+  - [320, 1, 1, None, 1, 1, false]
+- - [9, 18]
+  - 1
+  - Concat
+  - [1]
+- - -1
+  - 1
+  - ConvSyncBN
+  - [320, 1, 1, None, 1, 1, false]
+- - [12, 20]
+  - 1
+  - Concat
+  - [1]
+- - -1
+  - 1
+  - ConvSyncBN
+  - [320, 1, 1, None, 1, 1, false]
+head:
+- - 26
+  - 1
+  - Conv
+  - [256, 1, 1, None, 1, 1, false]
+- - -1
+  - 1
+  - AIFI
+  - [1024, 8]
+- - -1
+  - 1
+  - Conv
+  - [256, 1, 1, None, 1, 1, false]
+- - -1
+  - 1
+  - nn.Upsample
+  - [None, 2, nearest]
+- - 24
+  - 1
+  - Conv
+  - [256, 1, 1, None, 1, 1, false]
+- - [-2, -1]
+  - 1
+  - Add
+  - []
+- - -1
+  - 1
+  - RepNCSPELAN5
+  - [256, 512, 160, 4]
+- - -1
+  - 1
+  - Conv
+  - [256, 1, 1, None, 1, 1, false]
+- - -1
+  - 1
+  - nn.Upsample
+  - [None, 2, nearest]
+- - 22
+  - 1
+  - Conv
+  - [256, 1, 1, None, 1, 1, false]
+- - [-2, -1]
+  - 1
+  - Add
+  - []
+- - -1
+  - 1
+  - RepNCSPELAN5
+  - [256, 512, 160, 4]
+- - -1
+  - 1
+  - SCDown
+  - [256, 3, 2, false]
+- - [-1, 34]
+  - 1
+  - Add
+  - []
+- - -1
+  - 1
+  - RepNCSPELAN5
+  - [256, 512, 160, 4]
+- - -1
+  - 1
+  - SCDown
+  - [256, 3, 2, false]
+- - [-1, 29]
+  - 1
+  - Add
+  - []
+- - -1
+  - 1
+  - RepNCSPELAN5
+  - [256, 512, 160, 4]
+- - [38, 41, 44]
+  - 1
+  - Detect
+  - [nc]
