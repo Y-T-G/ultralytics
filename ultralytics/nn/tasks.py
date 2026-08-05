@@ -69,6 +69,7 @@ from ultralytics.nn.modules import (
     ScaledAdd,
     GatedUpsample,
     RepDWConv,
+    DilatedReparamDW,
     GCAttn,
     MogaGate,
     StripAttn,
@@ -81,9 +82,17 @@ from ultralytics.nn.modules import (
     DetectBoxContextFull,
     DetectBoxContextFullSep,
     DetectBoxContextSep,
+    DetectDGQP,
+    DetectFDR,
+    DetectFDRQ,
+    DetectFDRC,
+    DetectFGL,
+    DetectGC,
     DetectNorm,
     DetectROI,
+    DetectSeed,
     DetectSharedReg,
+    DetectTA,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -292,7 +301,7 @@ class BaseModel(torch.nn.Module):
                     m.conv_transpose = fuse_deconv_and_bn(m.conv_transpose, m.bn)
                     delattr(m, "bn")  # remove batchnorm
                     m.forward = m.forward_fuse  # update forward
-                if isinstance(m, (RepConv, RepDWConv, ACConv, DBBConv, MobileOneConv, MobileOneBlock, ReparamLargeKernelConv, RepGhostConv)):
+                if isinstance(m, (RepConv, RepDWConv, DilatedReparamDW, ACConv, DBBConv, MobileOneConv, MobileOneBlock, ReparamLargeKernelConv, RepGhostConv)):
                     m.fuse_convs()
                     m.forward = m.forward_fuse  # update forward
                 if isinstance(m, RepVGGDW):
@@ -1745,6 +1754,30 @@ def torch_safe_load(weight, safe_only=False):
     return ckpt, file
 
 
+_HEAD_FLAGS = (
+    "suppress", "rep_head", "o2o_dilated", "head_dilated", "head_repdw", "no_detach", "o2o_grad_scale",
+    "o2o_residual_head", "peak_pool_k", "fixed_c3", "head_c2", "head_depth", "fdr_steps", "o2o_share_towers",
+    "dfl_bias_prior", "seed_teacher", "box_dilated", "box_dilated_levels", "box_copies", "fgl_rho", "fdr_rf_mix", "fdr_ms_read",
+    "fdr_ms_levels", "fdr_rf_fast", "box_rf_mix", "o2o_maxfilter", "o2o_pss", "o2o_res_feat", "legacy",
+)
+
+
+def restore_head_flags(model):
+    """Re-apply yaml head switches onto the head instance after loading.
+
+    They used to be set on the class by parse_model, so a checkpoint loaded in a fresh process silently fell
+    back to class defaults (e.g. o2o_residual_head -> False, which breaks the forward pass).
+    """
+    yaml_cfg = getattr(model, "yaml", None)
+    head = getattr(model, "model", [None])[-1]
+    if not isinstance(yaml_cfg, dict) or not isinstance(head, Detect):
+        return model
+    for k in _HEAD_FLAGS:
+        if k in yaml_cfg and k not in head.__dict__:
+            setattr(head, k, yaml_cfg[k])
+    return model
+
+
 def load_checkpoint(weight, device=None, inplace=True, fuse=False):
     """Load a single model weights.
 
@@ -1763,6 +1796,7 @@ def load_checkpoint(weight, device=None, inplace=True, fuse=False):
     model = (ckpt.get("ema") or ckpt["model"]).float()  # FP32 model
 
     # Model compatibility updates
+    restore_head_flags(model)  # yaml head switches were class attributes in older checkpoints
     model.args = args  # attach args to model
     model.pt_path = weight  # attach *.pt file path to model
     model.task = getattr(model, "task", guess_model_task(model))
@@ -1810,6 +1844,25 @@ def parse_model(d, ch, verbose=True):
     o2o_grad_scale = d.get("o2o_grad_scale", 0.0)
     peak_pool_k = d.get("peak_pool_k", 0)
     fixed_c3 = d.get("fixed_c3", 0)
+    head_c2 = d.get("head_c2", 0)
+    head_depth = d.get("head_depth", 2)
+    fdr_steps = d.get("fdr_steps", 1)
+    o2o_share_towers = d.get("o2o_share_towers", False)
+    dfl_bias_prior = d.get("dfl_bias_prior", False)
+    seed_teacher = d.get("seed_teacher", "")
+    box_dilated = d.get("box_dilated", 0)
+    box_dilated_levels = d.get("box_dilated_levels", (1, 2))
+    box_copies = d.get("box_copies", 2)
+    fgl_rho = d.get("fgl_rho", 0.5)
+    fdr_rf_mix = d.get("fdr_rf_mix", ())
+    fdr_ms_read = d.get("fdr_ms_read", False)
+    fdr_ms_levels = d.get("fdr_ms_levels", None)
+    fdr_rf_fast = d.get("fdr_rf_fast", False)
+    box_rf_mix = d.get("box_rf_mix", ())
+    o2o_maxfilter = d.get("o2o_maxfilter", 0)
+    o2o_pss = d.get("o2o_pss", False)
+    o2o_res_feat = d.get("o2o_res_feat", False)
+    fdr_box_pool = d.get("fdr_box_pool", False)
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     scale = d.get("scale")
     scale_consts = {}  # named per-scale constants beyond [depth, width, max_channels], see `scale_args`
@@ -1999,9 +2052,17 @@ def parse_model(d, ch, verbose=True):
                 DetectBoxContextFull,
                 DetectBoxContextFullSep,
                 DetectBoxContextSep,
+                DetectDGQP,
+                DetectFDR,
+                DetectFDRQ,
+                DetectFDRC,
+                DetectFGL,
+                DetectGC,
                 DetectNorm,
                 DetectROI,
+                DetectSeed,
                 DetectSharedReg,
+                DetectTA,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,
@@ -2023,9 +2084,17 @@ def parse_model(d, ch, verbose=True):
                 DetectBoxContextFull,
                 DetectBoxContextFullSep,
                 DetectBoxContextSep,
+                DetectDGQP,
+                DetectFDR,
+                DetectFDRQ,
+                DetectFDRC,
+                DetectFGL,
+                DetectGC,
                 DetectNorm,
                 DetectROI,
+                DetectSeed,
                 DetectSharedReg,
+                DetectTA,
                 YOLOEDetect,
                 Segment,
                 Segment26,
@@ -2037,7 +2106,7 @@ def parse_model(d, ch, verbose=True):
                 OBB26,
             }:
                 m.legacy = legacy
-            if m in {Detect, DetectBoxContext, DetectBoxContextFull, DetectBoxContextFullSep, DetectBoxContextSep, DetectNorm, DetectROI, DetectSharedReg}:
+            if m in {Detect, DetectBoxContext, DetectBoxContextFull, DetectBoxContextFullSep, DetectBoxContextSep, DetectDGQP, DetectFDR, DetectFDRC, DetectFDRQ, DetectFGL, DetectGC, DetectNorm, DetectROI, DetectSeed, DetectSharedReg, DetectTA}:
                 m.suppress = suppress
                 m.rep_head = rep_head
                 m.o2o_dilated = o2o_dilated
@@ -2048,6 +2117,25 @@ def parse_model(d, ch, verbose=True):
                 m.o2o_residual_head = d.get("o2o_residual_head", False)
                 m.peak_pool_k = peak_pool_k
                 m.fixed_c3 = fixed_c3
+                m.head_c2 = head_c2
+                m.head_depth = head_depth
+                m.fdr_steps = fdr_steps
+                m.o2o_share_towers = o2o_share_towers
+                m.dfl_bias_prior = dfl_bias_prior
+                m.seed_teacher = seed_teacher
+                m.box_dilated = box_dilated
+                m.box_dilated_levels = box_dilated_levels
+                m.box_copies = box_copies
+                m.fgl_rho = fgl_rho
+                m.fdr_rf_mix = fdr_rf_mix
+                m.fdr_ms_read = fdr_ms_read
+                m.fdr_ms_levels = fdr_ms_levels
+                m.fdr_rf_fast = fdr_rf_fast
+                m.box_rf_mix = box_rf_mix
+                m.o2o_maxfilter = o2o_maxfilter
+                m.o2o_pss = o2o_pss
+                m.o2o_res_feat = o2o_res_feat
+                m.fdr_box_pool = fdr_box_pool
         elif m is v10Detect:
             args.append([ch[x] for x in f])
         elif m is ImagePoolingAttn:
@@ -2075,7 +2163,10 @@ def parse_model(d, ch, verbose=True):
         else:
             c2 = ch[f]
 
+        head_flags = {k: getattr(m, k) for k in _HEAD_FLAGS if isinstance(m, type) and hasattr(m, k)}
         m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        for k, v in head_flags.items():  # copy class-level yaml flags onto the instance so checkpoints
+            setattr(m_, k, v)  # reload correctly and concurrent models cannot clobber each other
         t = str(m)[8:-2].replace("__main__.", "")  # module type
         m_.np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
@@ -2086,6 +2177,12 @@ def parse_model(d, ch, verbose=True):
         if i == 0:
             ch = []
         ch.append(c2)
+    head = layers[-1]
+    if d.get("end2end") and isinstance(head, Detect) and not head.end2end:
+        LOGGER.warning(
+            f"WARNING ⚠️ 'end2end: True' but {type(head).__name__} reports end2end=False (its one2one branch is "
+            f"missing or raised), so the model trains and validates WITH NMS. Check the head's o2o modules."
+        )
     return torch.nn.Sequential(*layers), sorted(save)
 
 
@@ -2224,7 +2321,7 @@ def guess_model_family(model):
         # (incl. .engine), e.g. yolo27n-detr / yolo27x-detr / yolo27xxl-detr -> yolo27<scale>detr. This takes priority
         # over embedded metadata so engines route here too (the exporter stamps model_type="rtdetr" for every
         # RTDETRDecoder subclass, which would otherwise send RTDETRDecoderEfficient engines to RT-DETR).
-        if "yolodetr" in stem or re.search(r"yolo\d+[a-z]*detr", stem):
+        if "yolodetr" in stem or re.search(r"yolo\d+[a-z]*[-_]?detr", path.stem.lower()):
             return "yolodetr"
 
         family = metadata2family(_load_export_metadata(path))

@@ -27,7 +27,7 @@ from .block import (
     SwiGLUFFN,
     SpatialSuppressionGate,
 )
-from .conv import Conv, DWConv, RepConv, RepDWConv
+from .conv import Conv, DilatedReparamDW, DWConv, GCAttn, RepConv, RepDWConv, SoftRFMix, SoftRFMixFast
 from .dfine_transformer import DeimTransformerDecoder, DeimTransformerDecoderLayer, Integral
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
@@ -106,8 +106,18 @@ class Detect(nn.Module):
     head_dilated = False  # multi-dilation RepDWConv in BOTH o2m and o2o cls branches (swapped before deepcopy)
     head_repdw = False  # non-dilated RepDWConv (pure rep DW 3x3, unchanged inference graph) in both cls branches
     peak_pool_k = 0  # end2end inference-only local-max suppression kernel (0=off, odd int like 3/5)
+    o2o_maxfilter = 0  # 3D max filtering (DeFCN, CVPR21) on o2o scores, trained end-to-end (0=off, odd int)
+    o2o_pss = False  # PSS (TMM 2023): deploy the o2m branch gated by a class-agnostic one-positive selector
+    o2o_res_feat = False  # feed the residual head the penultimate cls-tower feature instead of raw neck features
     keep_one2many = False  # keep one2many head through fuse() to allow dual-head validation (set by the validator)
     fixed_c3 = 0  # fix cls branch hidden width regardless of nc (0 = auto: min(nc, 100)); keeps head shape stable across datasets for finetuning
+    head_depth = 2  # conv stages per tower before the predictor (2 = stock); depth instead of width
+    head_c2 = 0  # override box branch hidden width (0 = auto: max(16, ch[0] // 4, reg_max * 4))
+    o2o_share_towers = False  # o2o shares the o2m tower convs, only the final 1x1 predictors are separate
+    dfl_bias_prior = False  # init box predictor bias as a peaked DFL distribution around bin 2 (decoder anchor prior)
+    box_dilated = 0  # UniRepLKNet dilated-reparam DW kernel in the box tower (0=off, e.g. 9); fuses to 1x1 + DW KxK
+    box_rf_mix = ()  # per-location soft receptive-field mixing in the MAIN box tower (no FDR refine tower needed)
+    box_dilated_levels = (1, 2)  # levels the dilated-reparam box tower applies to (P4/P5 by default)
 
     def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
         """Initialize the YOLO detection layer with specified number of classes and channels.
@@ -124,14 +134,20 @@ class Detect(nn.Module):
         self.reg_max = reg_max  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
-        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], (self.fixed_c3 or min(self.nc, 100)))  # channels
+        c2 = self.head_c2 or max((16, ch[0] // 4, self.reg_max * 4))
+        c3 = max(ch[0], (self.fixed_c3 or min(self.nc, 100)))  # channels
         if self.rep_head:
             self.cv2 = nn.ModuleList(
                 nn.Sequential(RepConv(x, c2, 3, bn=(x == c2)), RepConv(c2, c2, 3, bn=True), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
             )
         else:
             self.cv2 = nn.ModuleList(
-                nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+                nn.Sequential(
+                    Conv(x, c2, 3),
+                    *(Conv(c2, c2, 3) for _ in range(self.head_depth - 1)),
+                    nn.Conv2d(c2, 4 * self.reg_max, 1),
+                )
+                for x in ch
             )
         if self.rep_head:
             self.cv3 = (
@@ -153,12 +169,18 @@ class Detect(nn.Module):
                 else nn.ModuleList(
                     nn.Sequential(
                         nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
-                        nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                        *(nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)) for _ in range(self.head_depth - 1)),
                         nn.Conv2d(c3, self.nc, 1),
                     )
                     for x in ch
                 )
             )
+        if self.box_dilated:
+            for i in self.box_dilated_levels:
+                self.cv2[i][0] = nn.Sequential(Conv(ch[i], c2, 1), DilatedReparamDW(c2, self.box_dilated))
+        if self.box_rf_mix:
+            for m in self.cv2:
+                m[0] = nn.Sequential(m[0], SoftRFMixFast(c2, len(self.box_rf_mix), cascade=False))
         if (self.head_dilated or self.head_repdw) and not self.legacy and not self.rep_head:
             dilated = bool(self.head_dilated)
             for m, x in zip(self.cv3, ch):
@@ -167,16 +189,33 @@ class Detect(nn.Module):
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
         if end2end:
-            if self.o2o_residual_head:
-                # Lightweight residual: share box head, learn cls correction only
+            if self.o2o_residual_head or self.o2o_pss:
+                # Share the o2m box head; the o2o path is either a per-class residual or a PSS gate
                 self.one2one_cv2 = None  # reuse o2m boxes
-                self.one2one_cv3 = None  # handled via residual
-                self.o2o_cls_res = nn.ModuleList()
-                for x in ch:
-                    conv = nn.Conv2d(x, self.nc, 1, bias=True)
-                    nn.init.zeros_(conv.weight)
-                    nn.init.zeros_(conv.bias)
-                    self.o2o_cls_res.append(nn.Sequential(DWConv(x, x, 3), conv))
+                self.one2one_cv3 = None  # handled via residual / selector
+                if self.o2o_pss:
+                    self.o2o_sel = nn.ModuleList()
+                    for x in ch:
+                        conv = nn.Conv2d(c2, 1, 1)
+                        nn.init.zeros_(conv.weight)
+                        nn.init.constant_(conv.bias, 0.0)  # sigmoid(0)=0.5: keeps the selector gradient alive (bias 4 is ~28x weaker)
+                        self.o2o_sel.append(nn.Sequential(Conv(x, c2, 1), DWConv(c2, c2, 3), conv))
+                else:
+                    self.o2o_cls_res = nn.ModuleList()
+                    for x in ch:
+                        # o2o_res_feat: read the o2m cls tower's penultimate feature (c3 wide), so
+                        # z_o2o = z_o2m + W_r f is an independent final classifier over a strong feature
+                        cin = c3 if self.o2o_res_feat else x
+                        conv = nn.Conv2d(cin, self.nc, 1, bias=True)
+                        nn.init.zeros_(conv.weight)
+                        nn.init.zeros_(conv.bias)
+                        self.o2o_cls_res.append(conv if self.o2o_res_feat else nn.Sequential(DWConv(x, x, 3), conv))
+            elif self.o2o_share_towers:
+                # Shared feature towers, split predictors: both losses train the same tower convs
+                # (the only channel for rich o2m supervision to reach the deployed branch when the
+                # trunk is frozen); only the final 1x1 predictions are branch-specific.
+                self.one2one_cv2 = nn.ModuleList(nn.Sequential(*m[:-1], copy.deepcopy(m[-1])) for m in self.cv2)
+                self.one2one_cv3 = nn.ModuleList(nn.Sequential(*m[:-1], copy.deepcopy(m[-1])) for m in self.cv3)
             else:
                 self.one2one_cv2 = copy.deepcopy(self.cv2)
                 self.one2one_cv3 = copy.deepcopy(self.cv3)
@@ -186,6 +225,8 @@ class Detect(nn.Module):
                         m[1][0] = RepDWConv(c3)
             if self.suppress:
                 self.o2o_suppress = nn.ModuleList(SpatialSuppressionGate(nc, k=5) for _ in range(self.nl))
+            if self.o2o_maxfilter:
+                self.mf_beta = nn.Parameter(torch.full((self.nl,), -3.0))
 
     @property
     def one2many(self):
@@ -237,13 +278,20 @@ class Detect(nn.Module):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         preds = self.forward_head(x, **self.one2many)
         if self.end2end:
-            if self.o2o_residual_head:
+            if self.o2o_pss:
+                # Deploy the o2m branch, gated by a class-agnostic selector: p = sigmoid(cls) * sigmoid(sel).
+                # Base logits/boxes are detached, so the selector loss only trains the selector.
+                bs = x[0].shape[0]
+                sel = torch.cat([self.o2o_sel[i](x[i].detach()).view(bs, 1, -1) for i in range(self.nl)], dim=-1)
+                one2one = dict(boxes=preds["boxes"].detach(), scores=self._product_logit(preds["scores"].detach(), sel), feats=x)
+            elif self.o2o_residual_head:
                 # Shared boxes from o2m (detached), cls = o2m_cls + lightweight residual
                 bs = x[0].shape[0]
                 o2o_scores = preds["scores"].detach()  # (B, nc, A) from o2m
                 cls_res = []
                 for i in range(self.nl):
-                    cls_res.append(self.o2o_cls_res[i](x[i].detach()).view(bs, self.nc, -1))
+                    f = self.cv3[i][:-1](x[i]).detach() if self.o2o_res_feat else x[i].detach()
+                    cls_res.append(self.o2o_cls_res[i](f).view(bs, self.nc, -1))
                 o2o_scores = o2o_scores + torch.cat(cls_res, dim=-1)
                 one2one = dict(boxes=preds["boxes"].detach(), scores=o2o_scores, feats=x)
             else:
@@ -255,6 +303,8 @@ class Detect(nn.Module):
                 else:
                     x_o2o = [xi.detach() for xi in x]
                 one2one = self.forward_head(x_o2o, **self.one2one)
+            if self.o2o_maxfilter:
+                one2one = {**one2one, "scores": self._max_filter(one2one["scores"], one2one["feats"])}
             preds = {"one2many": preds, "one2one": one2one}
         if self.training:
             return preds
@@ -277,6 +327,38 @@ class Detect(nn.Module):
             x = {**x, "scores": self._peak_suppress(x["scores"], x["feats"])}
         dbox = self._get_decode_boxes(x)
         return torch.cat((dbox, x["scores"].sigmoid()), 1)
+
+    @staticmethod
+    def _product_logit(z: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        """Logit whose sigmoid equals sigmoid(z) * sigmoid(s), so loss/assigner/inference need no changes."""
+        z, s = z.float().clamp(-15, 15), s.float().clamp(-15, 15)
+        return -torch.log((1 + torch.exp(-z)) * (1 + torch.exp(-s)) - 1 + 1e-9)
+
+    def _max_filter(self, scores: torch.Tensor, feats: list[torch.Tensor]) -> torch.Tensor:
+        """3D max filtering (DeFCN, CVPR 2021): suppress scores beaten by a neighbour in space or scale.
+
+        Unlike NMS this is a fixed local+cross-level max, so it is one max-pool plus fixed-scale resizes at
+        export. Trained end-to-end, so the head learns to cooperate with it. beta is zero-init: identity at
+        step 0, and a per-level learnable strength thereafter.
+        """
+        ks = self.o2o_maxfilter if isinstance(self.o2o_maxfilter, (list, tuple)) else [self.o2o_maxfilter] * self.nl
+        bs, nc = scores.shape[:2]
+        maps, offset = [], 0
+        for f in feats:
+            h, w = f.shape[2:]
+            maps.append(scores[..., offset : offset + h * w].view(bs, nc, h, w))
+            offset += h * w
+        beta = self.mf_beta.sigmoid()  # keep the suppression strength in (0, 1); raw init -3 -> ~0.05
+        out = []
+        for i, m in enumerate(maps):
+            tube = m  # align raw neighbours first, then pool once at the target resolution
+            if i > 0:  # finer level, pooled down
+                tube = torch.maximum(tube, F.max_pool2d(maps[i - 1], 2, 2))
+            if i < self.nl - 1:  # coarser level, upsampled
+                tube = torch.maximum(tube, F.interpolate(maps[i + 1], scale_factor=2, mode="nearest"))
+            best = F.max_pool2d(tube, ks[i], 1, ks[i] // 2)
+            out.append((m - beta[i].view(1, 1, 1, 1) * (best - m).clamp(min=0)).view(bs, nc, -1))
+        return torch.cat(out, dim=-1)
 
     def _peak_suppress(self, scores: torch.Tensor, feats: list[torch.Tensor]) -> torch.Tensor:
         """Zero non-local-max cls logits per level (NMS-free inference dedup)."""
@@ -323,16 +405,24 @@ class Detect(nn.Module):
         dbox = dist2bbox(self.dfl(x["boxes"]), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
         return torch.cat((dbox, x["scores"].sigmoid()), 1)
 
+    def _box_bias(self, bias):
+        """Fill a box predictor bias: constant 2.0, or a peaked DFL prior around bin 2."""
+        if self.dfl_bias_prior:
+            j = torch.arange(self.reg_max, dtype=bias.dtype, device=bias.device)
+            bias.data[:] = (-(j - 2.0).pow(2) / 2.0).repeat(4)
+        else:
+            bias.data[:] = 2.0
+
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
         for i, (a, b) in enumerate(zip(self.one2many["box_head"], self.one2many["cls_head"])):  # from
-            a[-1].bias.data[:] = 2.0  # box
+            self._box_bias(a[-1].bias)  # box
             b[-1].bias.data[: self.nc] = math.log(
                 5 / self.nc / (640 / self.stride[i]) ** 2
             )  # cls (.01 objects, 80 classes, 640 img)
-        if self.end2end and not self.o2o_residual_head:
+        if self.end2end and not self.o2o_residual_head and not self.o2o_pss:
             for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):  # from
-                a[-1].bias.data[:] = 2.0  # box
+                self._box_bias(a[-1].bias)  # box
                 b[-1].bias.data[: self.nc] = math.log(
                     5 / self.nc / (640 / self.stride[i]) ** 2
                 )  # cls (.01 objects, 80 classes, 640 img)
@@ -384,7 +474,7 @@ class Detect(nn.Module):
 
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
-        if not self.o2o_residual_head and not self.keep_one2many:
+        if not self.o2o_residual_head and not self.o2o_pss and not self.keep_one2many:
             self.cv2 = self.cv3 = None
         # residual head keeps cv2+cv3 since o2o inference needs o2m's box+cls as base
         # keep_one2many keeps cv2+cv3 so dual-head validation can score both heads (still conv-bn fused)
@@ -1016,6 +1106,661 @@ class DetectROI(Detect):
         fused = (s1 * s2_c).clamp(min=0).sqrt()
         y_out = torch.cat([refined, fused.unsqueeze(-1), cls_idx.float().unsqueeze(-1)], dim=-1)
         return y_out if self.export else (y_out, raw)
+
+
+class DetectFDR(Detect):
+    """Dense conv port of D-FINE FDR (ICLR 2025): residual refinement of DFL logits.
+
+    Stage 1 (inherited cv2) predicts coarse DFL logits. Stage 2 conditions on the feature map
+    concatenated with the stage-1 distribution (softmax over reg_max per side) and predicts a
+    residual added to the stage-1 logits. Last refine conv is zero-init so training starts
+    exactly at the Detect baseline. No queries, no attention, per-anchor conv only.
+    fdr_steps > 1 applies the (weight-shared) refinement recurrently, mimicking D-FINE's
+    multi-layer refinement at zero extra params. During training the stage-1 logits are kept
+    in the output dict ("boxes_s1") so E2ELoss can apply GO-LSD self-distillation.
+    """
+
+    fdr_steps = 1  # number of (weight-shared) refinement iterations
+    fdr_rf_mix = ()  # dilations of the per-location soft receptive-field mixer in the refine tower (()=off)
+    fdr_ms_read = False  # cross-level soft rereading of box evidence (ScaleRead)
+    fdr_ms_levels = None  # target levels for ScaleRead (None = all; [1, 2] = P4/P5 only)
+    fdr_rf_fast = False  # use the cheaper cascaded/bottlenecked SoftRFMixFast instead of SoftRFMix
+    fdr_box_pool = False  # box-conditioned pooling-pyramid rereading (BoxPoolRead)
+
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        """Initialize Detect then add per-level refinement branches (o2m + o2o copies)."""
+        super().__init__(nc, reg_max, end2end, ch)
+        c2 = self.head_c2 or max(16, ch[0] // 4, self.reg_max * 4)
+        mix = [(SoftRFMixFast(c2, len(self.fdr_rf_mix), cascade=self.fdr_rf_fast != 2) if self.fdr_rf_fast else SoftRFMix(c2, self.fdr_rf_mix))] if self.fdr_rf_mix else []
+        self.cv2_ref = nn.ModuleList(
+            nn.Sequential(Conv(x + 4 * self.reg_max, c2, 3), *copy.deepcopy(mix), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1))
+            for x in ch
+        )
+        for m in self.cv2_ref:
+            nn.init.zeros_(m[-1].weight)
+            nn.init.zeros_(m[-1].bias)
+        if self.fdr_ms_read:
+            self.cv2_ms = ScaleRead(ch, c2, 4 * self.reg_max, self.fdr_ms_levels)
+        if self.fdr_box_pool:
+            self.cv2_bp = nn.ModuleList(BoxPoolRead(x, self.reg_max) for x in ch)
+        if end2end and self.one2one_cv2 is not None:
+            self.one2one_cv2_ref = copy.deepcopy(self.cv2_ref)
+            if self.fdr_ms_read:
+                self.one2one_cv2_ms = copy.deepcopy(self.cv2_ms)
+            if self.fdr_box_pool:
+                self.one2one_cv2_bp = copy.deepcopy(self.cv2_bp)
+
+    @property
+    def one2many(self):
+        """One-to-many heads plus refinement branch."""
+        d = dict(box_head=self.cv2, cls_head=self.cv3, box_ref=self.cv2_ref)
+        if self.fdr_ms_read:
+            d["box_ms"] = self.cv2_ms
+        if self.fdr_box_pool:
+            d["box_pool"] = self.cv2_bp
+        return d
+
+    @property
+    def one2one(self):
+        """One-to-one heads plus refinement branch."""
+        d = dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, box_ref=getattr(self, "one2one_cv2_ref", None))
+        if hasattr(self, "o2o_suppress"):
+            d["suppress"] = self.o2o_suppress
+        if self.fdr_ms_read:
+            d["box_ms"] = getattr(self, "one2one_cv2_ms", None)
+        if self.fdr_box_pool:
+            d["box_pool"] = getattr(self, "one2one_cv2_bp", None)
+        return d
+
+    def _extra_reads(self, i, x, b, box_ms_out, box_pool):
+        """Add the cross-level and box-conditioned residual reads to the refined box logits."""
+        if box_ms_out is not None and box_ms_out[i] is not None:
+            b = b + box_ms_out[i]
+        if box_pool is not None:
+            b = b + box_pool[i](x[i], b.view(b.shape[0], 4, self.reg_max, *b.shape[2:]).softmax(2))
+        return b
+
+    def forward_head(self, x, box_head=None, cls_head=None, suppress=None, box_ref=None, box_ms=None, box_pool=None):
+        """Stage-1 boxes + residual distribution refinement, then concat as in Detect."""
+        if box_head is None or cls_head is None:  # for fused inference
+            return dict()
+        bs = x[0].shape[0]
+        boxes, boxes_s1 = [], []
+        ms = box_ms(x) if box_ms is not None else None
+        for i in range(self.nl):
+            b = box_head[i](x[i])  # (B, 4*reg_max, H, W)
+            boxes_s1.append(b.view(bs, 4 * self.reg_max, -1))
+            for _ in range(self.fdr_steps):
+                prob = b.view(bs, 4, self.reg_max, *b.shape[2:]).softmax(2).flatten(1, 2)
+                b = b + box_ref[i](torch.cat([x[i], prob], 1))
+            b = self._extra_reads(i, x, b, ms, box_pool)
+            boxes.append(b.view(bs, 4 * self.reg_max, -1))
+        boxes = torch.cat(boxes, dim=-1)
+        cls_feats = []
+        for i in range(self.nl):
+            c = cls_head[i](x[i])
+            if suppress is not None:
+                c = suppress[i](c)
+            cls_feats.append(c.view(bs, self.nc, -1))
+        out = dict(boxes=boxes, scores=torch.cat(cls_feats, dim=-1), feats=x)
+        if self.training:
+            out["boxes_s1"] = torch.cat(boxes_s1, dim=-1)
+        return out
+
+    def fuse(self):
+        """Drop o2m heads (incl. refinement) for inference."""
+        super().fuse()
+        if self.cv2 is None:
+            self.cv2_ref = None
+
+
+class DetectDGQP(Detect):
+    """GFLv2-style Distribution-Guided Quality Prediction for the e2e Detect head.
+
+    Statistics of the predicted DFL distribution (max, mean, sum of squares per side) feed a tiny
+    shared subnet whose output is added to the cls logits as a localization-quality logit.
+    Additive-logit variant of GFLv2's multiplicative J = C * I, with the paper's top-k stats
+    replaced by reduce-based stats for export friendliness. Zero-init so training starts
+    exactly at the Detect baseline. ~1k params, conv-only.
+    """
+
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        """Initialize Detect then add the shared quality subnet (o2m + o2o copies)."""
+        super().__init__(nc, reg_max, end2end, ch)
+        cq, ci = 64, 4 * 3
+        self.reg_conf = nn.Sequential(nn.Conv2d(ci, cq, 1), nn.ReLU(inplace=True), nn.Conv2d(cq, 1, 1))
+        nn.init.zeros_(self.reg_conf[-1].weight)
+        nn.init.zeros_(self.reg_conf[-1].bias)
+        if end2end and self.one2one_cv2 is not None:
+            self.one2one_reg_conf = copy.deepcopy(self.reg_conf)
+
+    @property
+    def one2many(self):
+        """One-to-many heads plus quality subnet."""
+        return dict(box_head=self.cv2, cls_head=self.cv3, quality=self.reg_conf)
+
+    @property
+    def one2one(self):
+        """One-to-one heads plus quality subnet."""
+        d = dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, quality=getattr(self, "one2one_reg_conf", None))
+        if hasattr(self, "o2o_suppress"):
+            d["suppress"] = self.o2o_suppress
+        return d
+
+    def forward_head(self, x, box_head=None, cls_head=None, suppress=None, quality=None):
+        """Detect forward with DFL-statistics quality logit added to cls scores."""
+        if box_head is None or cls_head is None:  # for fused inference
+            return dict()
+        bs = x[0].shape[0]
+        boxes, cls_feats = [], []
+        for i in range(self.nl):
+            b = box_head[i](x[i])  # (B, 4*reg_max, H, W)
+            prob = b.view(bs, 4, self.reg_max, *b.shape[2:]).softmax(2)
+            stat = torch.cat([prob.max(2, keepdim=True)[0], prob.mean(2, keepdim=True), prob.pow(2).sum(2, keepdim=True)], 2).flatten(1, 2)
+            c = cls_head[i](x[i]) + quality(stat)
+            if suppress is not None:
+                c = suppress[i](c)
+            boxes.append(b.view(bs, 4 * self.reg_max, -1))
+            cls_feats.append(c.view(bs, self.nc, -1))
+        return dict(boxes=torch.cat(boxes, dim=-1), scores=torch.cat(cls_feats, dim=-1), feats=x)
+
+    def fuse(self):
+        """Drop o2m heads (incl. quality subnet) for inference."""
+        super().fuse()
+        if self.cv2 is None:
+            self.reg_conf = None
+
+
+class DetectFDRQ(DetectFDR):
+    """DetectFDR + DGQP: quality logit computed from the REFINED distribution.
+
+    Combines D-FINE-style residual distribution refinement with a GFLv2-style quality logit
+    (max, mean, sum of squares of the refined DFL distribution) added to the cls score.
+    Both extras zero-init, so training starts exactly at the Detect baseline.
+    """
+
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        """Initialize DetectFDR then add the shared quality subnet (o2m + o2o copies)."""
+        super().__init__(nc, reg_max, end2end, ch)
+        cq, ci = 64, 4 * 3
+        self.reg_conf = nn.Sequential(nn.Conv2d(ci, cq, 1), nn.ReLU(inplace=True), nn.Conv2d(cq, 1, 1))
+        nn.init.zeros_(self.reg_conf[-1].weight)
+        nn.init.zeros_(self.reg_conf[-1].bias)
+        if end2end and self.one2one_cv2 is not None:
+            self.one2one_reg_conf = copy.deepcopy(self.reg_conf)
+
+    @property
+    def one2many(self):
+        """One-to-many heads plus refinement branch and quality subnet."""
+        return dict(**super().one2many, quality=self.reg_conf)
+
+    @property
+    def one2one(self):
+        """One-to-one heads plus refinement branch and quality subnet."""
+        return dict(**super().one2one, quality=getattr(self, "one2one_reg_conf", None))
+
+    def forward_head(self, x, box_head=None, cls_head=None, suppress=None, box_ref=None, quality=None, box_ms=None, box_pool=None):
+        """FDR refinement, then quality logit from the refined distribution added to cls."""
+        if box_head is None or cls_head is None:  # for fused inference
+            return dict()
+        bs = x[0].shape[0]
+        boxes, boxes_s1, cls_feats = [], [], []
+        ms = box_ms(x) if box_ms is not None else None
+        for i in range(self.nl):
+            b = box_head[i](x[i])  # (B, 4*reg_max, H, W)
+            boxes_s1.append(b.view(bs, 4 * self.reg_max, -1))
+            for _ in range(self.fdr_steps):
+                prob = b.view(bs, 4, self.reg_max, *b.shape[2:]).softmax(2).flatten(1, 2)
+                b = b + box_ref[i](torch.cat([x[i], prob], 1))
+            b = self._extra_reads(i, x, b, ms, box_pool)
+            prob = b.view(bs, 4, self.reg_max, *b.shape[2:]).softmax(2)
+            stat = torch.cat([prob.max(2, keepdim=True)[0], prob.mean(2, keepdim=True), prob.pow(2).sum(2, keepdim=True)], 2).flatten(1, 2)
+            c = cls_head[i](x[i]) + quality(stat)
+            if suppress is not None:
+                c = suppress[i](c)
+            boxes.append(b.view(bs, 4 * self.reg_max, -1))
+            cls_feats.append(c.view(bs, self.nc, -1))
+        out = dict(boxes=torch.cat(boxes, dim=-1), scores=torch.cat(cls_feats, dim=-1), feats=x)
+        if self.training:
+            out["boxes_s1"] = torch.cat(boxes_s1, dim=-1)
+        return out
+
+    def fuse(self):
+        """Drop o2m heads (incl. refinement and quality subnet) for inference."""
+        super().fuse()
+        if self.cv2 is None:
+            self.reg_conf = None
+
+
+class ScaleRead(nn.Module):
+    """Cross-level soft rereading of the box evidence (ASFF / DynamicHead scale attention direction).
+
+    Deformable attention reads every feature level per query; this reads all levels at the anchor's own
+    location after fixed-ratio alignment (strided avg-pool down, nearest upsample up) and mixes them with
+    a per-location softmax over the three levels. Output convs are zero-init, so it starts as a no-op.
+    Export: 1x1 conv, fixed-stride AvgPool, fixed-scale Resize, concat, softmax, mul, add.
+    """
+
+    def __init__(self, ch: tuple, c: int = 64, nb: int = 64, levels=None):
+        """Initialize ScaleRead.
+
+        Args:
+            ch (tuple): Input channels per level.
+            c (int): Shared projection width.
+            nb (int): Output channels (4 * reg_max).
+            levels (tuple | None): Target levels that get the cross-level read (None = all). Skipping P3
+                keeps the large-object gain while leaving high-resolution small-object evidence unmixed,
+                and drops the block's cost since the P3 branch does all the upsampling at 80x80.
+        """
+        super().__init__()
+        self.nl = len(ch)
+        self.levels = tuple(range(self.nl)) if levels is None else tuple(levels)
+        self.proj = nn.ModuleList(Conv(x, c, 1) for x in ch)
+        self.gate = nn.ModuleList(nn.Conv2d(c * self.nl, self.nl, 1) if i in self.levels else nn.Identity() for i in range(self.nl))
+        self.out = nn.ModuleList(nn.Conv2d(c, nb, 1) if i in self.levels else nn.Identity() for i in range(self.nl))
+        for m in self.out:
+            if isinstance(m, nn.Conv2d):
+                nn.init.zeros_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor | None]:
+        """Return one box-logit residual per target level, mixed from all aligned levels."""
+        p = [self.proj[i](x[i]) for i in range(self.nl)]
+        out = []
+        for i in range(self.nl):
+            if i not in self.levels:
+                out.append(None)
+                continue
+            aligned = []
+            for j in range(self.nl):
+                if j < i:
+                    aligned.append(F.avg_pool2d(p[j], 2 ** (i - j), 2 ** (i - j)))
+                elif j > i:
+                    aligned.append(F.interpolate(p[j], scale_factor=2 ** (j - i), mode="nearest"))
+                else:
+                    aligned.append(p[j])
+            a = self.gate[i](torch.cat(aligned, 1)).softmax(1)
+            y = aligned[0] * a.narrow(1, 0, 1)
+            for j in range(1, self.nl):
+                y = y + aligned[j] * a.narrow(1, j, 1)
+            out.append(self.out[i](y))
+        return out
+
+
+class BoxPoolRead(nn.Module):
+    """Box-conditioned pooling pyramid: predicted-box-shaped rereading without grid_sample.
+
+    RoIAlign and box attention need to sample at predicted coordinates. This keeps the read centered on
+    the anchor but lets the predicted (l, t, r, b) distances pick the pooling footprint (point, 3x3, 7x7,
+    1x9, 9x1) through a softmax gate, recovering box-conditioned receptive-field scale and aspect.
+    Output conv is zero-init. Export: 1x1 conv, fixed AvgPool, softmax, mul, add.
+    """
+
+    def __init__(self, c1: int, reg_max: int = 16, cq: int = 32):
+        """Initialize BoxPoolRead.
+
+        Args:
+            c1 (int): Input channels of the level feature.
+            reg_max (int): DFL bins per side.
+            cq (int): Pooling-branch width.
+        """
+        super().__init__()
+        self.reg_max = reg_max
+        self.q = Conv(c1, cq, 1)
+        self.gate = nn.Sequential(Conv(4, 16, 1), nn.Conv2d(16, 5, 1))
+        self.out = nn.Conv2d(cq, 4 * reg_max, 1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        self.register_buffer("proj", torch.arange(reg_max, dtype=torch.float), persistent=False)
+
+    def forward(self, x: torch.Tensor, prob: torch.Tensor) -> torch.Tensor:
+        """Mix pooled reads by a gate conditioned on the predicted per-side distances."""
+        d = prob.mul(self.proj.view(1, 1, -1, 1, 1).to(prob.dtype)).sum(2)  # (B, 4, H, W)
+        a = self.gate(d).softmax(1)
+        q = self.q(x)
+        pools = (
+            q,
+            F.avg_pool2d(q, 3, 1, 1),
+            F.avg_pool2d(q, 7, 1, 3),
+            F.avg_pool2d(q, (1, 9), 1, (0, 4)),
+            F.avg_pool2d(q, (9, 1), 1, (4, 0)),
+        )
+        y = pools[0] * a.narrow(1, 0, 1)
+        for i in range(1, len(pools)):
+            y = y + pools[i] * a.narrow(1, i, 1)
+        return self.out(y)
+
+
+class DetectFGL(Detect):
+    """Relative fine-grained refinement (D-FINE, ICLR 2025) with a fixed non-uniform residual codebook.
+
+    Stage 1 (inherited cv2) predicts absolute DFL logits, decoded to distances d0. Stage 2 predicts a
+    distribution over a fixed, zero-centered, non-uniformly spaced codebook W in [-1, 1] and applies a
+    scale-relative correction d1 = d0 + rho * d0 * (softmax(r) @ W), so refinement solves a small
+    centered correction instead of relearning absolute edge distances. Zero-init residual predictor
+    makes the codebook expectation 0 at step 0, i.e. training starts exactly at the Detect baseline.
+    Export ops: conv, softmax, matmul with a constant, mul, add.
+    """
+
+    fgl_rho = 0.5  # residual scale relative to the stage-1 distance
+    fgl_curve = 3.0  # codebook curvature (larger = finer spacing near zero)
+
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        """Initialize Detect then add the residual codebook branches (o2m + o2o copies)."""
+        super().__init__(nc, reg_max, end2end, ch)
+        c2 = self.head_c2 or max(16, ch[0] // 4, self.reg_max * 4)
+        self.cv2_ref = nn.ModuleList(
+            nn.Sequential(Conv(x + 4 * self.reg_max, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1))
+            for x in ch
+        )
+        for m in self.cv2_ref:
+            nn.init.zeros_(m[-1].weight)
+            nn.init.zeros_(m[-1].bias)
+        u = torch.linspace(-1, 1, self.reg_max)
+        w = u.sign() * (self.fgl_curve * u.abs()).expm1() / math.expm1(self.fgl_curve)
+        self.register_buffer("fgl_W", w, persistent=False)
+        self.register_buffer("fgl_proj", torch.arange(self.reg_max, dtype=torch.float), persistent=False)
+        if end2end and self.one2one_cv2 is not None:
+            self.one2one_cv2_ref = copy.deepcopy(self.cv2_ref)
+
+    @property
+    def one2many(self):
+        """One-to-many heads plus refinement branch."""
+        return dict(box_head=self.cv2, cls_head=self.cv3, box_ref=self.cv2_ref)
+
+    @property
+    def one2one(self):
+        """One-to-one heads plus refinement branch."""
+        d = dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, box_ref=getattr(self, "one2one_cv2_ref", None))
+        if hasattr(self, "o2o_suppress"):
+            d["suppress"] = self.o2o_suppress
+        return d
+
+    def forward_head(self, x, box_head=None, cls_head=None, suppress=None, box_ref=None):
+        """Stage-1 logits + codebook residual, returning both plus the refined distances."""
+        if box_head is None or cls_head is None:  # for fused inference
+            return dict()
+        bs = x[0].shape[0]
+        boxes, refs, dists = [], [], []
+        for i in range(self.nl):
+            b = box_head[i](x[i])  # (B, 4*reg_max, H, W)
+            prob = b.view(bs, 4, self.reg_max, -1).softmax(2)
+            d0 = prob.mul(self.fgl_proj.view(1, 1, -1, 1).to(prob.dtype)).sum(2)  # (B, 4, A_l)
+            r = box_ref[i](torch.cat([x[i], prob.flatten(1, 2).view_as(b)], 1))
+            delta = r.view(bs, 4, self.reg_max, -1).softmax(2).mul(self.fgl_W.view(1, 1, -1, 1).to(b.dtype)).sum(2)
+            dists.append(d0 + self.fgl_rho * d0 * delta)
+            boxes.append(b.view(bs, 4 * self.reg_max, -1))
+            refs.append(r.view(bs, 4 * self.reg_max, -1))
+        cls_feats = []
+        for i in range(self.nl):
+            c = cls_head[i](x[i])
+            if suppress is not None:
+                c = suppress[i](c)
+            cls_feats.append(c.view(bs, self.nc, -1))
+        out = dict(
+            boxes=torch.cat(boxes, dim=-1),
+            scores=torch.cat(cls_feats, dim=-1),
+            feats=x,
+            distances=torch.cat(dists, dim=-1),
+        )
+        if self.training:
+            out["boxes_ref"] = torch.cat(refs, dim=-1)
+        return out
+
+    def _get_decode_boxes(self, x):
+        """Decode from the refined distances instead of the stage-1 DFL logits."""
+        shape = x["feats"][0].shape
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
+            self.shape = shape
+        return self.decode_bboxes(x["distances"], self.anchors.unsqueeze(0)) * self.strides
+
+    def fuse(self):
+        """Drop o2m heads (incl. refinement) for inference."""
+        super().fuse()
+        if self.cv2 is None:
+            self.cv2_ref = None
+
+
+class DetectFDRC(DetectFDR):
+    """DetectFDR with target-duplicated residual predictors (Deep Regression Tightness, ICLR 2025).
+
+    The final 1x1 of each refinement branch predicts `box_copies` independent residual maps trained on
+    the same target; the deployed residual is their mean, which folds back into a single conv at fuse()
+    because convolution is linear. Copies are initialized to +/- eps so their mean stays exactly the
+    zero-init FDR residual while symmetry is broken.
+    """
+
+    box_copies = 2  # number of duplicated residual predictors
+    box_copy_eps = 1e-3  # symmetry-breaking init scale
+
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        """Initialize DetectFDR then widen the residual predictors into `box_copies` copies."""
+        super().__init__(nc, reg_max, end2end, ch)
+        nb = 4 * self.reg_max
+        for m in self.cv2_ref:
+            old = m[-1]
+            conv = nn.Conv2d(old.in_channels, nb * self.box_copies, 1)
+            nn.init.normal_(conv.weight.data, std=self.box_copy_eps)
+            nn.init.zeros_(conv.bias.data)
+            conv.weight.data[nb:] = -conv.weight.data[: nb * (self.box_copies - 1)]  # copies cancel exactly
+            m[-1] = conv
+        if end2end and self.one2one_cv2 is not None:
+            self.one2one_cv2_ref = copy.deepcopy(self.cv2_ref)
+
+    def forward_head(self, x, box_head=None, cls_head=None, suppress=None, box_ref=None):
+        """FDR refinement using the mean of the duplicated residual predictors."""
+        if box_head is None or cls_head is None:  # for fused inference
+            return dict()
+        bs = x[0].shape[0]
+        nb = 4 * self.reg_max
+        boxes, boxes_s1, copies = [], [], []
+        for i in range(self.nl):
+            b = box_head[i](x[i])
+            boxes_s1.append(b.view(bs, nb, -1))
+            for _ in range(self.fdr_steps):
+                prob = b.view(bs, 4, self.reg_max, *b.shape[2:]).softmax(2).flatten(1, 2)
+                r = box_ref[i](torch.cat([x[i], prob], 1))
+                nk = r.shape[1] // nb  # 1 once the copies are folded at fuse()
+                if self.training and nk > 1:
+                    copies.append(b.detach().view(bs, nb, -1).unsqueeze(0) + r.view(bs, nk, nb, -1).transpose(0, 1))
+                b = b + r.view(bs, nk, nb, *r.shape[2:]).mean(1)
+            boxes.append(b.view(bs, nb, -1))
+        cls_feats = []
+        for i in range(self.nl):
+            c = cls_head[i](x[i])
+            if suppress is not None:
+                c = suppress[i](c)
+            cls_feats.append(c.view(bs, self.nc, -1))
+        out = dict(boxes=torch.cat(boxes, dim=-1), scores=torch.cat(cls_feats, dim=-1), feats=x)
+        if self.training:
+            out["boxes_s1"] = torch.cat(boxes_s1, dim=-1)
+            out["boxes_copies"] = torch.cat(copies, dim=-1)  # (copies, B, 4*reg_max, A)
+        return out
+
+    def fuse(self):
+        """Fold the duplicated residual predictors into their mean, then drop the o2m heads."""
+        nb = 4 * self.reg_max
+        for refs in (getattr(self, "one2one_cv2_ref", None), self.cv2_ref):
+            if refs is None:
+                continue
+            for m in refs:
+                old = m[-1]
+                if old.out_channels == nb:
+                    continue
+                conv = nn.Conv2d(old.in_channels, nb, 1).requires_grad_(False)
+                conv.weight.data = old.weight.data.view(self.box_copies, nb, *old.weight.shape[1:]).mean(0)
+                conv.bias.data = old.bias.data.view(self.box_copies, nb).mean(0)
+                m[-1] = conv
+        super().fuse()
+
+
+class TATower(nn.Module):
+    """Per-level TOOD-lite tower: shared inter-task convs + per-task layer attention + preds."""
+
+    def __init__(self, c1, ct, nc, reg_max):
+        """Build shared 2-conv stack, box/cls layer-attention gates, and prediction convs."""
+        super().__init__()
+        self.inter = nn.ModuleList([Conv(c1, ct, 3), Conv(ct, ct, 3)])
+        self.la_box = nn.Conv2d(2 * ct, 2, 1)
+        self.la_cls = nn.Conv2d(2 * ct, 2, 1)
+        self.box = nn.Conv2d(ct, 4 * reg_max, 3, padding=1)
+        self.cls = nn.Conv2d(ct, nc, 3, padding=1)
+
+    def forward(self, x):
+        """Return (box_out, cls_out) from task-attended blends of the shared stack."""
+        f1 = self.inter[0](x)
+        f2 = self.inter[1](f1)
+        g = torch.cat([f1, f2], 1).mean((2, 3), keepdim=True)
+        wb = self.la_box(g).sigmoid()
+        wc = self.la_cls(g).sigmoid()
+        fb = f1 * wb[:, 0:1] + f2 * wb[:, 1:2]
+        fc = f1 * wc[:, 0:1] + f2 * wc[:, 1:2]
+        return self.box(fb), self.cls(fc)
+
+
+class DetectTA(Detect):
+    """TOOD-lite task-aligned head (TOOD, ICCV 2021 oral).
+
+    Replaces the decoupled parallel box/cls branches with a shared inter-task conv stack per
+    level; each task blends the stack's features via a learned layer-attention gate before its
+    prediction conv, so cls and box supervision interact through shared features. The paper's
+    deformable spatial alignment is intentionally omitted (export constraint). Conv, pool,
+    sigmoid, mul only.
+    """
+
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        """Build parent, then swap the decoupled branches for shared TA towers."""
+        super().__init__(nc, reg_max, end2end, ch)
+        ct = self.fixed_c3 or max(ch[0], 128)
+        del self.cv2, self.cv3
+        self.ta = nn.ModuleList(TATower(x, ct, nc, self.reg_max) for x in ch)
+        if end2end:
+            del self.one2one_cv2, self.one2one_cv3
+            self.one2one_ta = copy.deepcopy(self.ta)
+
+    @property
+    def one2many(self):
+        """One-to-many TA towers."""
+        return dict(ta=self.ta)
+
+    @property
+    def one2one(self):
+        """One-to-one TA towers."""
+        d = dict(ta=self.one2one_ta)
+        if hasattr(self, "o2o_suppress"):
+            d["suppress"] = self.o2o_suppress
+        return d
+
+    def forward_head(self, x, ta=None, suppress=None):
+        """Concatenate box and cls predictions from the TA towers."""
+        if ta is None:  # for fused inference
+            return dict()
+        bs = x[0].shape[0]
+        boxes, cls_feats = [], []
+        for i in range(self.nl):
+            b, c = ta[i](x[i])
+            if suppress is not None:
+                c = suppress[i](c)
+            boxes.append(b.view(bs, 4 * self.reg_max, -1))
+            cls_feats.append(c.view(bs, self.nc, -1))
+        return dict(boxes=torch.cat(boxes, dim=-1), scores=torch.cat(cls_feats, dim=-1), feats=x)
+
+    def bias_init(self):
+        """Initialize TA tower prediction biases (requires stride availability)."""
+        heads = [self.ta] + ([self.one2one_ta] if self.end2end else [])
+        for towers in heads:
+            for i, t in enumerate(towers):
+                t.box.bias.data[:] = 2.0
+                t.cls.bias.data[: self.nc] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
+
+    def fuse(self):
+        """Drop o2m TA towers for inference."""
+        if not self.o2o_residual_head and not self.keep_one2many:
+            self.ta = None
+
+
+class DetectGC(Detect):
+    """Detect with per-level global context (GCNet) on the head inputs.
+
+    A GCAttn block per level adds a softmax-pooled scene-level context vector to every
+    position before the box/cls branches: a cheap stand-in for the decoder's global
+    attention. Gradients reach the GC blocks through the o2m branch only (o2o input is
+    detached downstream, matching stock Detect behavior).
+    """
+
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        """Initialize Detect then add one GCAttn per level."""
+        super().__init__(nc, reg_max, end2end, ch)
+        self.gc = nn.ModuleList(GCAttn(x) for x in ch)
+
+    def forward(self, x):
+        """Apply global context per level, then standard Detect forward."""
+        return super().forward([g(xi) for g, xi in zip(self.gc, x)])
+
+
+class SeedClsBranch(nn.Module):
+    """Cls branch shaped like the decoder's encoder classifier: proj -> residual tower -> 1x1 cls.
+
+    proj mirrors the decoder input_proj (1x1 Conv+BN to hd, Identity when channels already match);
+    the tower is zero-init so at step zero the branch computes exactly proj -> classifier.
+    """
+
+    def __init__(self, c1, hd, nc):
+        """Build projection, zero-init residual tower, and 1x1 classifier."""
+        super().__init__()
+        self.proj = nn.Identity() if c1 == hd else Conv(c1, hd, 1, act=False)
+        self.tower = nn.Sequential(DWConv(hd, hd, 3), Conv(hd, hd, 1), DWConv(hd, hd, 3), nn.Conv2d(hd, hd, 1))
+        nn.init.zeros_(self.tower[-1].weight)
+        nn.init.zeros_(self.tower[-1].bias)
+        self.cls = nn.Conv2d(hd, nc, 1)
+
+    def forward(self, x):
+        """Project, residual-refine, classify."""
+        z = self.proj(x)
+        return self.cls(z + self.tower(z))
+
+
+class DetectSeed(Detect):
+    """Detect with the cls branch transplanted from the decoder teacher's encoder classifier.
+
+    Copies input_proj (P3/P5 1x1 Conv+BN, P4 Identity) and enc_score_head (Linear reshaped to 1x1
+    conv) from the checkpoint named by the `seed_teacher` yaml key, so the dense cls logits equal
+    the teacher's pre-top-k encoder logits at step zero; a zero-init residual tower then learns
+    the correction. Box branch is stock Detect. Conv and add only.
+    """
+
+    seed_teacher = ""  # ckpt path, set via yaml `seed_teacher`
+
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        """Build parent, replace cls branches, and transplant teacher weights if configured."""
+        super().__init__(nc, reg_max, end2end, ch)
+        hd = 256
+        del self.cv3
+        self.cv3 = nn.ModuleList(SeedClsBranch(x, hd, nc) for x in ch)
+        if self.seed_teacher:
+            ck = torch.load(self.seed_teacher, map_location="cpu", weights_only=False)
+            t = (ck.get("ema") or ck["model"]).float().model[-1]
+            for i, m in enumerate(self.cv3):
+                src = t.input_proj[i]
+                if not isinstance(m.proj, nn.Identity):
+                    m.proj.conv.weight.data.copy_(src[0].weight.data)
+                    m.proj.bn.load_state_dict(src[1].state_dict())
+                m.cls.weight.data.copy_(t.enc_score_head.weight.data.view(self.nc, hd, 1, 1))
+                m.cls.bias.data.copy_(t.enc_score_head.bias.data)
+        if end2end and self.one2one_cv3 is not None:
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+    def bias_init(self):
+        """Box biases as usual; seeded cls biases are kept (else standard prior)."""
+        heads = [(self.cv2, self.cv3)] + (
+            [(self.one2one_cv2, self.one2one_cv3)] if self.end2end and not self.o2o_residual_head else []
+        )
+        for box_l, cls_l in heads:
+            for i, (a, b) in enumerate(zip(box_l, cls_l)):
+                self._box_bias(a[-1].bias)
+                if not self.seed_teacher:
+                    b.cls.bias.data[: self.nc] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
 
 
 class Segment(Detect):

@@ -950,6 +950,12 @@ class BaseTrainer:
             LOGGER.info("Closing dataloader mosaic")
             self.train_loader.dataset.close_mosaic(hyp=copy(self.args))
 
+    def set_model_names_for_load(self, model):
+        """Set class names before load() so the cls head can be remapped by class name."""
+        if getattr(self.args, "cls_remap", True) and self.data.get("names"):
+            model.names = self.data["names"]
+        return model
+
     def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         """Construct an optimizer for the given model.
 
@@ -1017,7 +1023,7 @@ class BaseTrainer:
             import re
 
             # higher lr for certain parameters in MuSGD when funetuning
-            pattern = re.compile(r"(?=.*23)(?=.*cv3)|proto\.semseg|flow_model")
+            pattern = re.compile(r"(?=.*23)(?=.*(cv3|o2o_cls_res|o2o_sel))|proto\.semseg|flow_model")
             g_ = []  # new param groups
             for x in g:
                 p = x.pop("params")

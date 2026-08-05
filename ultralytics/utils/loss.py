@@ -137,18 +137,32 @@ class DFLoss(nn.Module):
         """Initialize the DFL module with regularization maximum."""
         super().__init__()
         self.reg_max = reg_max
+        self.smooth = 0.0
+        self.crps = 0.0
 
     def __call__(self, pred_dist: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Return sum of left and right DFL losses from https://ieeexplore.ieee.org/document/9792391."""
         target = target.clamp_(0, self.reg_max - 1 - 0.01)
+        if self.smooth > 0:  # Gaussian soft targets over all bins instead of 2-bin linear interpolation
+            bins = torch.arange(self.reg_max, device=target.device, dtype=pred_dist.dtype)
+            t = torch.exp(-(bins - target.view(-1, 1)).pow(2) / (2 * self.smooth**2))
+            t = t / t.sum(-1, keepdim=True)
+            return -(t * F.log_softmax(pred_dist, -1)).sum(-1).view(target.shape).mean(-1, keepdim=True)
         tl = target.long()  # target left
         tr = tl + 1  # target right
         wl = tr - target  # weight left
         wr = 1 - wl  # weight right
-        return (
+        loss = (
             F.cross_entropy(pred_dist, tl.view(-1), reduction="none").view(tl.shape) * wl
             + F.cross_entropy(pred_dist, tr.view(-1), reduction="none").view(tl.shape) * wr
-        ).mean(-1, keepdim=True)
+        )
+        if self.crps > 0:  # CRPS: squared CDF distance, penalizes far-off bins more than adjacent ones
+            q = torch.zeros_like(pred_dist)
+            q.scatter_(1, tl.view(-1, 1), wl.view(-1, 1).to(q.dtype))
+            q.scatter_add_(1, tr.view(-1, 1).clamp(max=self.reg_max - 1), wr.view(-1, 1).to(q.dtype))
+            crps = (pred_dist.softmax(-1).cumsum(-1) - q.cumsum(-1)).pow(2).mean(-1).view(tl.shape)
+            loss = loss + self.crps * crps
+        return loss.mean(-1, keepdim=True)
 
 
 class BboxLoss(nn.Module):
@@ -158,6 +172,9 @@ class BboxLoss(nn.Module):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.decoupled = False  # decouple regression weights from the class-coupled TAL target score
+        self.dfl_iou_power = 0.5
+        self.dfl_iou_floor = 0.05
 
     def forward(
         self,
@@ -174,7 +191,12 @@ class BboxLoss(nn.Module):
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        if self.decoupled:
+            loss_iou = (1.0 - iou).sum() / fg_mask.sum().clamp_(min=1)
+            weight = iou.detach().clamp(0, 1).pow(self.dfl_iou_power).clamp(min=self.dfl_iou_floor)
+            target_scores_sum = weight.sum().clamp(min=1e-9)
+        else:
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -392,6 +414,8 @@ class v8DetectionLoss:
         self.reg_max = m.reg_max
         self.device = device
         self.use_vfl = False  # varifocal loss flag, set externally by E2ELoss
+        self.use_mal = False  # matchability-aware loss flag (DEIM), set externally by E2ELoss
+        self.mal_gamma = 1.5  # MAL focusing exponent
 
         self.use_dfl = m.reg_max > 1
 
@@ -405,6 +429,9 @@ class v8DetectionLoss:
         )
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        self.fgl_gain = 0.0  # residual codebook loss weight (DetectFGL), set externally by E2ELoss
+        self.fgl_rho = getattr(m, "fgl_rho", 0.5)
+        self.fgl_W = getattr(m, "fgl_W", None)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
@@ -432,8 +459,36 @@ class v8DetectionLoss:
             # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
+    def _fgl_loss(self, pred_ref, pred_distri, pred_bboxes, anchor_points, target_ltrb_boxes, fg_mask):
+        """Fine-grained residual loss (D-FINE): two-neighbour CE on the non-uniform codebook, IoU weighted."""
+        with autocast(enabled=False):
+            w = self.fgl_W.float()
+            b, a, _ = pred_distri.shape
+            d0 = pred_distri.float().view(b, a, 4, self.reg_max).softmax(3).matmul(self.proj)[fg_mask].reshape(-1)
+            target = bbox2dist(anchor_points, target_ltrb_boxes, self.reg_max - 1)[fg_mask].reshape(-1)
+            t = ((target - d0) / (self.fgl_rho * d0 + 1e-4)).detach().clamp(w[0], w[-1])
+            idx = torch.searchsorted(w, t.contiguous()).clamp(1, self.reg_max - 1)
+            left, right = w[idx - 1], w[idx]
+            wr = (t - left) / (right - left + 1e-9)
+            r = pred_ref[fg_mask].float().view(-1, self.reg_max)
+            ce = F.cross_entropy(r, idx - 1, reduction="none") * (1 - wr) + F.cross_entropy(r, idx, reduction="none") * wr
+            iou = bbox_iou(pred_bboxes[fg_mask], target_ltrb_boxes[fg_mask], xywh=False, CIoU=False)
+            weight = iou.detach().float().clamp(0.05, 1)
+            return (ce.view(-1, 4).mean(-1, keepdim=True) * weight).sum() / weight.sum().clamp(min=1e-9)
+
     def _cls_loss(self, pred_scores, target_scores, target_scores_sum, dtype):
-        """Compute classification loss (BCE or VFL)."""
+        """Compute classification loss (BCE, VFL or MAL)."""
+        if self.use_mal:
+            # MAL (DEIM, CVPR 2025): positives target q^gamma with weight 1 (no VFL-style down-weighting of
+            # low-quality matches), negatives weighted by p^gamma without alpha.
+            t = target_scores.to(dtype)
+            pos = (t > 0).to(dtype)
+            pred_sigmoid = pred_scores.detach().sigmoid()
+            weight = pos + (1 - pos) * pred_sigmoid.pow(self.mal_gamma)
+            return (
+                F.binary_cross_entropy_with_logits(pred_scores.float(), t.pow(self.mal_gamma).float(), reduction="none")
+                * weight
+            ).sum() / target_scores_sum
         if self.use_vfl:
             target_labels = (target_scores > 0).to(dtype)
             pred_sigmoid = pred_scores.detach().sigmoid()
@@ -501,7 +556,10 @@ class v8DetectionLoss:
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
         # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+        if "distances" in preds:  # DetectFGL: boxes come from the refined distances, not the DFL logits
+            pred_bboxes = dist2bbox(preds["distances"].permute(0, 2, 1), anchor_points, xywh=False)
+        else:
+            pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
@@ -517,6 +575,7 @@ class v8DetectionLoss:
         self._last_target_gt_idx = target_gt_idx
         self._last_target_bboxes = target_bboxes
         self._last_target_scores = target_scores
+        self._last_pred_bboxes = pred_bboxes.detach() * stride_tensor
 
         target_scores_sum = max(target_scores.sum(), 1)
 
@@ -536,6 +595,15 @@ class v8DetectionLoss:
                 imgsz,
                 stride_tensor,
             )
+            if self.fgl_gain > 0 and "boxes_ref" in preds:
+                loss[2] = loss[2] + self.fgl_gain * self._fgl_loss(
+                    preds["boxes_ref"].permute(0, 2, 1),
+                    pred_distri,
+                    pred_bboxes,
+                    anchor_points,
+                    target_bboxes / stride_tensor,
+                    fg_mask,
+                )
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
@@ -1237,11 +1305,14 @@ class E2ELoss:
         # Read optional config from model YAML
         yaml_cfg = getattr(model, "yaml", {})
         # Residual head: equal weights, no decay (backbone needs steady gradient)
-        if yaml_cfg.get("o2o_residual_head", False):
-            self.o2m = 0.5
-            self.o2o = 0.5
-            self.o2m_copy = 0.5
-            self.final_o2m = 0.5
+        if yaml_cfg.get("o2o_residual_head", False) or yaml_cfg.get("o2o_pss", False):
+            # o2o consumes detached boxes/scores/features, so its loss cannot reach the o2m towers:
+            # there is no gradient conflict to balance and o2m can keep its full weight.
+            self.o2m = yaml_cfg.get("o2m_init", 0.5)
+            self.o2o = yaml_cfg.get("o2o_weight", 0.5)
+            self.o2m_copy = self.o2m
+            self.final_o2m = yaml_cfg.get("o2m_final", self.o2m)
+            self.fixed_o2o = True  # o2o path is independent (detached), so its weight must not track 1 - o2m
         else:
             o2m_init = yaml_cfg.get("o2m_init", 0.8)
             o2m_final = yaml_cfg.get("o2m_final", 0.1)
@@ -1252,11 +1323,69 @@ class E2ELoss:
         # Soft label distillation from one2many to one2one
         self.soft_distill = yaml_cfg.get("soft_distill", False)
         self.distill_weight = yaml_cfg.get("distill_weight", 0.5)
+        # GO-LSD (D-FINE): distill the refined DFL distribution into the stage-1 logits (DetectFDR heads)
+        self.fdr_distill = yaml_cfg.get("fdr_distill", False)
+        self.fdr_distill_weight = yaml_cfg.get("fdr_distill_weight", 1.0)
+        # DDF (D-FINE): same refined->stage-1 KL but over all anchors, temperature-scaled, weighted by
+        # IoU on matched anchors and by refined confidence elsewhere, with sqrt pos/neg balancing
+        self.fdr_ddf = yaml_cfg.get("fdr_ddf", False)
+        self.fdr_ddf_gain = yaml_cfg.get("fdr_ddf_gain", 0.25)
+        self.fdr_ddf_temperature = yaml_cfg.get("fdr_ddf_temperature", 5.0)
+        # Gaussian soft DFL targets (sigma in bin units); 0 keeps the stock 2-bin interpolation
+        dfl_smooth = yaml_cfg.get("dfl_smooth", 0.0)
+        if dfl_smooth > 0:
+            self.one2many.bbox_loss.dfl_loss.smooth = dfl_smooth
+            self.one2one.bbox_loss.dfl_loss.smooth = dfl_smooth
+        # Relative codebook refinement loss (DetectFGL)
+        fgl_gain = yaml_cfg.get("fgl_gain", 0.0)
+        if fgl_gain > 0:
+            self.one2many.fgl_gain = fgl_gain
+            self.one2one.fgl_gain = fgl_gain
+        # Target-duplicated residual predictors (DetectFDRC): supervise each copy on the shared target
+        self.box_copy_gain = yaml_cfg.get("box_copy_gain", 0.0)
+        # Self-CrossKD: o2o box features routed through the (grad-detached) o2m box tail
+        self.self_crosskd = yaml_cfg.get("self_crosskd", False)
+        self.crosskd_gain = yaml_cfg.get("crosskd_gain", 0.25)
+        self.crosskd_temperature = yaml_cfg.get("crosskd_temperature", 2.0)
+        self.head = model.model[-1] if self.self_crosskd else None
+        # CRPS auxiliary on the DFL distribution (ordinal, penalizes far bins)
+        dfl_crps = yaml_cfg.get("dfl_crps_gain", 0.0)
+        if dfl_crps > 0:
+            self.one2many.bbox_loss.dfl_loss.crps = dfl_crps
+            self.one2one.bbox_loss.dfl_loss.crps = dfl_crps
+        # Decoupled regression weighting: IoU-only CIoU/DFL weights instead of the class-coupled TAL score
+        if yaml_cfg.get("reg_decoupled", False):
+            for bl in (self.one2many.bbox_loss, self.one2one.bbox_loss):
+                bl.decoupled = True
+                bl.dfl_iou_power = yaml_cfg.get("dfl_iou_power", 0.5)
+                bl.dfl_iou_floor = yaml_cfg.get("dfl_iou_floor", 0.05)
         # Consistent matching: use one2many's best assignment for one2one
         self.consistent_match = yaml_cfg.get("consistent_match", False)
         # Varifocal loss for one2one classification
         if yaml_cfg.get("varifocal", False):
             self.one2one.use_vfl = True
+        # Matchability-aware loss (DEIM) for one2one classification
+        if yaml_cfg.get("mal", False):
+            self.one2one.use_mal = True
+            self.one2one.mal_gamma = yaml_cfg.get("mal_gamma", 1.5)
+        # TAL alpha override for one2one assigner (lower = position-dominant targets, Stable-DINO direction)
+        o2o_tal_alpha = yaml_cfg.get("o2o_tal_alpha", None)
+        if o2o_tal_alpha is not None:
+            self.one2one.assigner.alpha = o2o_tal_alpha
+        # MS-DETR-style auxiliary o2m-assigned loss applied directly to the o2o head outputs
+        self.o2o_aux_o2m = yaml_cfg.get("o2o_aux_o2m", 0.0)
+        # Decoder-teacher distillation: frozen DETR head from a ckpt runs on the shared neck feats,
+        # its detections become pseudo-GT for the o2o branch (CrossKD direction)
+        self.kd_teacher_path = yaml_cfg.get("decoder_teacher", "")
+        self.kd_weight = yaml_cfg.get("kd_weight", 1.0)
+        self.kd_conf = yaml_cfg.get("kd_conf", 0.3)
+        # Dense KD: distill the teacher's PRE-top-k encoder cls map (one score per anchor, same grid
+        # order as the dense head) into the o2o scores: keeps the full confidence structure that
+        # thresholded pseudo-GT discards
+        self.kd_dense_weight = yaml_cfg.get("kd_dense_weight", 0.0)
+        self.kd_teacher = None
+        if self.kd_teacher_path:
+            self.kd = loss_fn(model, tal_topk=7, tal_topk2=1)
         # Progressive topk annealing for one2one assigner
         self.topk_anneal = yaml_cfg.get("topk_anneal", False)
         self.topk2_start = yaml_cfg.get("topk2_start", 3)
@@ -1281,6 +1410,18 @@ class E2ELoss:
         if yaml_cfg.get("target_top_one", False):
             self.one2one.assigner.target_top_one = True
             self.one2many.assigner.target_top_one = True
+        # Assigned-winner listwise duplicate gap: push box-consistent duplicates below the TAL-assigned
+        # positive in logit space, area-ramped so it only acts on large GTs (where NMS-free suppression fails)
+        self.dup_rank = yaml_cfg.get("dup_rank", False)
+        self.dup_rank_gain = yaml_cfg.get("dup_rank_gain", 0.2)
+        self.dup_rank_margin = yaml_cfg.get("dup_rank_margin", 0.8)
+        self.dup_rank_temperature = yaml_cfg.get("dup_rank_temperature", 0.25)
+        self.dup_rank_topk = yaml_cfg.get("dup_rank_topk", 4)
+        self.dup_gt_iou = yaml_cfg.get("dup_gt_iou", 0.5)
+        self.dup_pair_iou = yaml_cfg.get("dup_pair_iou", 0.6)
+        self.dup_area_start = yaml_cfg.get("dup_area_start", 0.010)
+        self.dup_area_full = yaml_cfg.get("dup_area_full", 0.0225)
+        self.dup_rank_warmup = yaml_cfg.get("dup_rank_warmup", 10)
         # Rank-pair penalty: for each GT, top-2 one2one score must fall below top-1 by margin
         self.rank_pair = yaml_cfg.get("rank_pair", False)
         self.rank_margin = yaml_cfg.get("rank_margin", 0.5)
@@ -1310,6 +1451,98 @@ class E2ELoss:
 
         total = loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o
 
+        # GO-LSD: KL(stage-1 || refined.detach()) on fg anchors of each branch (DetectFDR heads)
+        if self.fdr_distill:
+            lsd = None
+            for branch, crit in ((one2many, self.one2many), (one2one, self.one2one)):
+                s1 = branch.get("boxes_s1")
+                fg = getattr(crit, "_last_fg_mask", None)
+                if s1 is None or fg is None or not fg.sum():
+                    continue
+                rm = crit.reg_max
+                t = branch["boxes"].detach().permute(0, 2, 1)[fg].view(-1, 4, rm).float().softmax(-1)
+                s = s1.permute(0, 2, 1)[fg].view(-1, 4, rm).float()
+                kl = F.kl_div(F.log_softmax(s, -1), t, reduction="batchmean")
+                lsd = kl if lsd is None else lsd + kl
+            if lsd is not None:
+                batch_size = one2one["scores"].shape[0]
+                lsd_component = torch.zeros_like(total)
+                lsd_component[2] = lsd * self.fdr_distill_weight * batch_size
+                total = total + lsd_component
+
+        # DDF: dense temperature-scaled refined->stage-1 KL, IoU/confidence weighted, sqrt pos-neg balanced
+        if self.fdr_ddf:
+            ddf = None
+            temp = self.fdr_ddf_temperature
+            for branch, crit in ((one2many, self.one2many), (one2one, self.one2one)):
+                s1 = branch.get("boxes_s1")
+                fg = getattr(crit, "_last_fg_mask", None)
+                if s1 is None or fg is None or not fg.sum():
+                    continue
+                bs, na = fg.shape
+                rm = crit.reg_max
+                with autocast(enabled=False):
+                    t = branch["boxes"].detach().permute(0, 2, 1).reshape(bs, na, 4, rm).float()
+                    s = s1.permute(0, 2, 1).reshape(bs, na, 4, rm).float()
+                    kl = (temp**2) * F.kl_div(
+                        F.log_softmax(s / temp, -1), F.softmax(t / temp, -1), reduction="none"
+                    ).sum(-1).mean(-1)
+                    w = branch["scores"].detach().permute(0, 2, 1).float().sigmoid().amax(-1)
+                    w = w.masked_scatter(
+                        fg,
+                        bbox_iou(crit._last_pred_bboxes[fg], crit._last_target_bboxes[fg], xywh=False, CIoU=False)
+                        .squeeze(-1)
+                        .clamp(0, 1)
+                        .float(),
+                    )
+                    weighted = kl * w
+                    sp, sn = fg.sum().float().sqrt(), (~fg).sum().float().sqrt()
+                    d = (weighted[fg].mean() * sp + weighted[~fg].mean() * sn) / (sp + sn)
+                ddf = d if ddf is None else ddf + d
+            if ddf is not None:
+                ddf_component = torch.zeros_like(total)
+                ddf_component[2] = ddf * self.fdr_ddf_gain * one2one["scores"].shape[0]
+                total = total + ddf_component
+
+        # Target duplication: supervise each residual copy on the same assignment as its averaged output
+        if self.box_copy_gain > 0:
+            copy_loss = None
+            for branch, crit in ((one2many, self.one2many), (one2one, self.one2one)):
+                copies = branch.get("boxes_copies")
+                fg = getattr(crit, "_last_fg_mask", None)
+                if copies is None or fg is None or not fg.sum():
+                    continue
+                for c in copies:
+                    lc = crit.loss_from_targets(
+                        {**branch, "boxes": c, "feats": branch["feats"]},
+                        crit._last_target_bboxes,
+                        crit._last_target_scores,
+                        fg,
+                    )[0]
+                    lc = lc[0] + lc[2]  # box + dfl only, cls is shared with the averaged predictor
+                    copy_loss = lc if copy_loss is None else copy_loss + lc
+            if copy_loss is not None:
+                copy_component = torch.zeros_like(total)
+                copy_component[0] = copy_loss * self.box_copy_gain
+                total = total + copy_component
+
+        # Self-CrossKD (CVPR 2024): route o2o box features through the o2m box tail (params detached)
+        # and distill toward the o2m box distribution, so the o2o predictor never serves two targets
+        if self.self_crosskd:
+            xkd = self._self_crosskd_loss(one2many, one2one)
+            if xkd is not None:
+                xkd_component = torch.zeros_like(total)
+                xkd_component[2] = xkd * self.crosskd_gain * one2one["scores"].shape[0]
+                total = total + xkd_component
+
+        # Listwise duplicate gap on the assigned o2o positives
+        if self.dup_rank:
+            dup = self._dup_rank_loss(one2one)
+            if dup is not None:
+                dup_component = torch.zeros_like(total)
+                dup_component[1] = dup * self.dup_rank_gain
+                total = total + dup_component
+
         # Rank-pair penalty on one2one scores
         if self.rank_pair:
             rank_pen = self._rank_pair_loss(one2one, batch)
@@ -1330,7 +1563,108 @@ class E2ELoss:
             distill_component[1] = distill_loss * self.distill_weight
             total = total + distill_component
 
+        # MS-DETR-style aux: o2m assignment applied directly to the o2o head outputs (kept last:
+        # it reuses self.one2many and clobbers its _last_* stashes)
+        if self.o2o_aux_o2m > 0:
+            total = total + self.one2many.loss(one2one, batch)[0] * self.o2o_aux_o2m
+
+        # Decoder-teacher distillation: teacher dets on shared neck feats -> pseudo-GT for o2o
+        if self.kd_teacher_path:
+            if self.kd_teacher is None:
+                ck = torch.load(self.kd_teacher_path, map_location="cpu", weights_only=False)
+                t = (ck.get("ema") or ck["model"]).float().model[-1]
+                self.kd_teacher = t.eval().requires_grad_(False).to(one2one["scores"].device)
+            t_feats = [f.detach().float() for f in one2one["feats"]]
+            if self.kd_weight > 0:
+                with torch.no_grad(), autocast(enabled=False):
+                    ty = self.kd_teacher(t_feats)
+                    ty = ty[0] if isinstance(ty, (tuple, list)) else ty  # (B, N, 6) [cxcywh norm, conf, cls]
+                b, n = ty.shape[:2]
+                keep = ty[..., 4] > self.kd_conf
+                bi = torch.arange(b, device=ty.device).view(-1, 1).expand(-1, n)[keep]
+                t_batch = {"batch_idx": bi.float(), "cls": ty[..., 5][keep], "bboxes": ty[..., :4][keep]}
+                total = total + self.kd.loss(one2one, t_batch)[0] * self.kd_weight
+            if self.kd_dense_weight > 0:
+                kt = self.kd_teacher
+                with torch.no_grad(), autocast(enabled=False):
+                    tf, tshapes = kt._get_encoder_input(t_feats)
+                    if kt.dynamic or kt.shapes != tshapes:  # keep valid_mask in sync with current shapes
+                        kt.anchors, kt.valid_mask = kt._generate_anchors(tshapes, dtype=tf.dtype, device=tf.device)
+                        kt.shapes = tshapes
+                    t_dense = kt.enc_score_head(kt._project_encoder_features(tf))
+                    t_dense = t_dense.sigmoid().clamp(1e-4, 1 - 1e-4)  # (B, A, nc), anchor order matches
+                with autocast(enabled=False):
+                    s_logits = one2one["scores"].float().permute(0, 2, 1)  # (B, A, nc)
+                    dense_loss = F.binary_cross_entropy_with_logits(s_logits, t_dense, reduction="mean")
+                dense_component = torch.zeros_like(total)
+                dense_component[1] = dense_loss * self.kd_dense_weight * s_logits.shape[0]
+                total = total + dense_component
+
         return total, loss_one2one[1]
+
+    def _self_crosskd_loss(self, one2many: dict[str, torch.Tensor], one2one: dict[str, torch.Tensor]):
+        """Feed o2o box-tower mid features through the o2m box tail and distill toward the o2m boxes."""
+        head, feats = self.head, one2one["feats"]
+        o2m_tower, o2o_tower = getattr(head, "cv2", None), getattr(head, "one2one_cv2", None)
+        fg = getattr(self.one2many, "_last_fg_mask", None)
+        if o2m_tower is None or o2o_tower is None or fg is None or not fg.sum():
+            return None
+        bs, rm, temp = feats[0].shape[0], head.reg_max, self.crosskd_temperature
+        cross = []
+        for i in range(head.nl):
+            mid = o2o_tower[i][0](feats[i])
+            for m in o2m_tower[i][1:]:  # o2m tail with detached parameters: gradients reach mid only
+                params = {k: v.detach() for k, v in m.named_parameters()}
+                buffers = {k: v.detach() for k, v in m.named_buffers()}
+                mid = torch.func.functional_call(m, {**params, **buffers}, (mid,))
+            cross.append(mid.view(bs, 4 * rm, -1))
+        with autocast(enabled=False):
+            s = torch.cat(cross, dim=-1).permute(0, 2, 1)[fg].float().view(-1, 4, rm)
+            t = one2many["boxes"].detach().permute(0, 2, 1)[fg].float().view(-1, 4, rm)
+            w = self.one2many._last_target_scores.sum(-1)[fg].float().unsqueeze(-1)
+            kl = F.kl_div(F.log_softmax(s / temp, -1), F.softmax(t / temp, -1), reduction="none").sum(-1)
+            return (temp**2) * (kl * w).sum() / w.sum().clamp(min=1e-9) / 4
+
+    def _dup_rank_loss(self, one2one: dict[str, torch.Tensor]):
+        """Enlarge the logit gap between each assigned o2o positive and its box-consistent duplicates."""
+        crit = self.one2one
+        fg = getattr(crit, "_last_fg_mask", None)
+        if fg is None or not fg.sum():
+            return None
+        ramp = min(max((self.updates - self.dup_rank_warmup / 2) / max(self.dup_rank_warmup / 2, 1), 0.0), 1.0)
+        if ramp <= 0:
+            return None
+        with autocast(enabled=False):
+            scores = one2one["scores"].permute(0, 2, 1).float()  # (B, A, nc) logits
+            tb, pb = crit._last_target_bboxes, crit._last_pred_bboxes  # image units, (B, A, 4)
+            imgsz = one2one["feats"][0].shape[2] * crit.stride[0]
+            bi, ai = fg.nonzero(as_tuple=True)  # one positive per matched GT (topk2=1)
+            gtb = tb[bi, ai]  # (N, 4) the GT box each winner is matched to
+            area = ((gtb[:, 2] - gtb[:, 0]) * (gtb[:, 3] - gtb[:, 1])) / (imgsz**2)
+            w_area = ((area - self.dup_area_start) / (self.dup_area_full - self.dup_area_start)).clamp(0, 1)
+            keep = w_area > 0
+            if not keep.any():
+                return None
+            bi, ai, gtb, w_area = bi[keep], ai[keep], gtb[keep], w_area[keep]
+            cls = crit._last_target_scores[bi, ai].argmax(-1)  # (N,) class of each winner
+            cand = pb[bi]  # (N, A, 4) all anchor boxes of the winner's image
+            n, a = cand.shape[:2]
+            iou_gt = bbox_iou(cand.reshape(-1, 4), gtb.repeat_interleave(a, 0), xywh=False).view(n, a)
+            iou_win = bbox_iou(cand.reshape(-1, 4), pb[bi, ai].repeat_interleave(a, 0), xywh=False).view(n, a)
+            dup = (iou_gt >= self.dup_gt_iou) & (iou_win >= self.dup_pair_iou) & (~fg[bi])
+            dup[torch.arange(n, device=dup.device), ai] = False  # never penalize the winner itself
+            if not dup.any():
+                return None
+            z = scores[bi, :, :].gather(2, cls.view(-1, 1, 1).expand(-1, a, 1)).squeeze(-1)  # (N, A) winner-class logits
+            z_pos = z[torch.arange(n, device=z.device), ai]
+            t = self.dup_rank_temperature
+            zd = z.masked_fill(~dup, -1e4)
+            top = zd.topk(min(self.dup_rank_topk, a), dim=-1).values
+            top = top.masked_fill(top <= -1e3, -1e4)
+            smax = t * torch.logsumexp(top / t, dim=-1)  # smooth max over the hardest duplicates
+            valid = dup.any(-1)
+            loss = t * F.softplus((smax - z_pos + self.dup_rank_margin) / t)
+            return ramp * (loss[valid] * w_area[valid]).mean()
 
     def _rank_pair_loss(self, one2one: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Penalize 2nd-highest one2one score near each GT to enforce single-peak assignment."""
@@ -1365,6 +1699,30 @@ class E2ELoss:
         top2 = masked.topk(2, dim=-1)
         top2_vals = top2.values  # (N, 2)
         top2_idx = top2.indices  # (N, 2)
+
+        # Anchor the winner to the TAL-assigned positive, not the class-score max: otherwise this loss can
+        # promote an unmatched anchor that the main o2o loss is simultaneously pushing down.
+        fg = getattr(self.one2one, "_last_fg_mask", None)
+        gt_idx = getattr(self.one2one, "_last_target_gt_idx", None)
+        if fg is not None and gt_idx is not None and fg.any():
+            gt_start = torch.zeros(bs, dtype=torch.long, device=device)  # first GT row index per image
+            counts = torch.bincount(batch_idx, minlength=bs)
+            gt_start[1:] = counts.cumsum(0)[:-1]
+            bi, ai = fg.nonzero(as_tuple=True)
+            rows = gt_start[bi] + gt_idx[bi, ai]  # global GT row of each assigned positive
+            keep = rows < sel_scores.shape[0]
+            rows, bi, ai = rows[keep], bi[keep], ai[keep]
+            win = torch.full((sel_scores.shape[0],), -1, dtype=torch.long, device=device)
+            win[rows] = ai
+            has_win = win >= 0
+            assigned = sel_scores.gather(1, win.clamp(min=0).unsqueeze(1)).squeeze(1)  # (N,)
+            # runner-up = best in-GT anchor that is NOT the assigned winner
+            other = masked.scatter(1, win.clamp(min=0).unsqueeze(1), float("-inf"))
+            runner_vals, runner_idx = other.max(-1)
+            top2_vals = torch.stack([torch.where(has_win, assigned, top2_vals[:, 0]),
+                                     torch.where(has_win, runner_vals, top2_vals[:, 1])], 1)
+            top2_idx = torch.stack([torch.where(has_win, win.clamp(min=0), top2_idx[:, 0]),
+                                    torch.where(has_win, runner_idx, top2_idx[:, 1])], 1)
 
         valid = in_gt.sum(-1) >= 2  # (N,)
         if self.rank_min_area > 0:
@@ -1408,7 +1766,8 @@ class E2ELoss:
         """Update the weights for one-to-many and one-to-one losses based on the decay schedule."""
         self.updates += 1
         self.o2m = self.decay(self.updates)
-        self.o2o = max(self.total - self.o2m, 0)
+        if not getattr(self, "fixed_o2o", False):
+            self.o2o = max(self.total - self.o2m, 0)
         # Progressive topk annealing: reduce topk2 from topk2_start toward 1
         if self.topk_anneal:
             total_epochs = max(self.one2one.hyp.epochs - 1, 1)

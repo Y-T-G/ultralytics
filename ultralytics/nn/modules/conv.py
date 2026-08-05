@@ -1423,6 +1423,160 @@ class RepDWConv(nn.Module):
         self.__delattr__("bn")
 
 
+class SoftRFMix(nn.Module):
+    """Per-location soft selection over fixed sampling geometries (involution/LSKNet direction).
+
+    Deformable conv learns *where* to sample; this learns *how much* to trust each of several fixed
+    tap layouts (DW 3x3 at dilation 1/2/3, i.e. receptive field 3/5/7) with a per-pixel softmax, which
+    recovers content-conditioned receptive-field size without any learned coordinate. Output projection
+    is zero-init, so the block starts as an identity. Export: DW conv, 1x1 conv, softmax, mul, add.
+    """
+
+    def __init__(self, c: int, dilations=(1, 2, 3)):
+        """Initialize SoftRFMix.
+
+        Args:
+            c (int): Number of input/output channels.
+            dilations (tuple): Dilations of the parallel depthwise branches.
+        """
+        super().__init__()
+        self.dw = nn.ModuleList(Conv(c, c, 3, 1, p=d, g=c, d=d, act=False) for d in dilations)
+        self.gate = nn.Sequential(Conv(c, max(c // 4, 8), 1), nn.Conv2d(max(c // 4, 8), len(dilations), 1))
+        self.proj = nn.Conv2d(c, c, 1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mix the fixed-geometry branches with per-location weights and add as a residual."""
+        a = self.gate(x).softmax(1)
+        y = self.dw[0](x) * a.narrow(1, 0, 1)
+        for i in range(1, len(self.dw)):
+            y = y + self.dw[i](x) * a.narrow(1, i, 1)
+        return x + self.proj(y)
+
+
+class SoftRFMixFast(nn.Module):
+    """Cheaper SoftRFMix: bottleneck channels, cascaded dilation-1 taps, gate on the reduced tensor.
+
+    Same idea as SoftRFMix (per-location softmax over receptive-field sizes) with three cost fixes: the
+    mixing runs at c/r channels, the 3/5/7 receptive fields come from a cascade of dilation-1 depthwise
+    convs instead of dilated ones (contiguous memory access), and the gate reads the reduced tensor.
+    Output projection is zero-init, so the block starts as an identity.
+    """
+
+    def __init__(self, c: int, n: int = 3, r: int = 2, cascade: bool = True):
+        """Initialize SoftRFMixFast.
+
+        Args:
+            c (int): Number of input/output channels.
+            n (int): Number of taps (receptive fields 3, 5, 7, ...).
+            r (int): Channel reduction ratio of the bottleneck.
+            cascade (bool): Chain dilation-1 taps (fewer FLOPs, serialized) or run dilated taps in
+                parallel (more FLOPs, but independent kernels, which is faster at batch 1).
+        """
+        super().__init__()
+        cr = max(c // r, 16)
+        self.cascade = cascade
+        self.reduce = Conv(c, cr, 1)
+        self.dw = nn.ModuleList(
+            Conv(cr, cr, 3, 1, g=cr, act=False) if cascade else Conv(cr, cr, 3, 1, p=d, g=cr, d=d, act=False)
+            for d in range(1, n + 1)
+        )
+        self.gate = nn.Conv2d(cr, n, 1)
+        self.proj = nn.Conv2d(cr, c, 1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Cascade depthwise taps, mix them per location, project back and add."""
+        z = self.reduce(x)
+        a = self.gate(z).softmax(1)
+        u, y = z, 0
+        for i, m in enumerate(self.dw):
+            u = m(u) if self.cascade else m(z)
+            y = y + u * a.narrow(1, i, 1)
+        return x + self.proj(y)
+
+
+class DilatedReparamDW(nn.Module):
+    """UniRepLKNet (CVPR 2024) Dilated Reparam Block, depthwise only.
+
+    A large depthwise KxK conv runs in parallel with several small dilated depthwise branches and a
+    BN identity. All branches fuse into a single non-dilated DW KxK conv at inference, since a (k, d)
+    dilated kernel is a sparse ((k-1)*d+1) kernel.
+    """
+
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(self, c: int, k: int = 9, act: bool | nn.Module = True, branches=((5, 1), (3, 2), (3, 3), (3, 4))):
+        """Initialize DilatedReparamDW.
+
+        Args:
+            c (int): Number of input/output channels.
+            k (int): Kernel size of the base (and fused) depthwise conv.
+            act (bool | nn.Module): Activation function.
+            branches (tuple): (kernel, dilation) pairs of the small parallel branches.
+        """
+        super().__init__()
+        self.c, self.k = c, k
+        self.branches = tuple((kb, db) for kb, db in branches if (kb - 1) * db + 1 <= k)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        self.conv1 = Conv(c, c, k, 1, g=c, act=False)
+        self.convs = nn.ModuleList(
+            Conv(c, c, kb, 1, p=(kb - 1) * db // 2, g=c, d=db, act=False) for kb, db in self.branches
+        )
+        self.bn = nn.BatchNorm2d(c)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through parallel branches (training mode)."""
+        out = self.conv1(x) + self.bn(x)
+        for m in self.convs:
+            out = out + m(x)
+        return self.act(out)
+
+    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the fused DW conv (deploy mode)."""
+        return self.act(self.conv(x))
+
+    def _expand(self, kernel: torch.Tensor, d: int) -> torch.Tensor:
+        """Expand a (k, d) depthwise kernel into an equivalent dense KxK kernel."""
+        kb = kernel.shape[-1]
+        ke = (kb - 1) * d + 1
+        if d > 1:
+            sparse = torch.zeros(self.c, 1, ke, ke, device=kernel.device, dtype=kernel.dtype)
+            sparse[:, :, ::d, ::d] = kernel
+            kernel = sparse
+        p = (self.k - ke) // 2
+        return F.pad(kernel, [p, p, p, p])
+
+    def get_equivalent_kernel_bias(self):
+        """Merge all branches into a single equivalent DW KxK kernel and bias."""
+        k, b = RepDWConv._fuse_bn(self.conv1.conv, self.conv1.bn)
+        for m, (_, d) in zip(self.convs, self.branches):
+            kb, bb = RepDWConv._fuse_bn(m.conv, m.bn)
+            k = k + self._expand(kb, d)
+            b = b + bb
+        std = (self.bn.running_var + self.bn.eps).sqrt()
+        kc = self.k // 2
+        k[:, 0, kc, kc] += self.bn.weight / std
+        b = b + self.bn.bias - self.bn.running_mean * self.bn.weight / std
+        return k, b
+
+    def fuse_convs(self):
+        """Fuse branches into a single DW convolution for inference."""
+        if hasattr(self, "conv"):
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.conv = nn.Conv2d(self.c, self.c, self.k, 1, self.k // 2, groups=self.c, bias=True).requires_grad_(False)
+        self.conv.weight.data = kernel
+        self.conv.bias.data = bias
+        for para in self.parameters():
+            para.detach_()
+        self.__delattr__("conv1")
+        self.__delattr__("convs")
+        self.__delattr__("bn")
+
+
 class StripAttn(nn.Module):
     """Strip-pooling attention with a symmetric sigmoid gate (SPNet CVPR 2020, gate per ZipDepth).
 
