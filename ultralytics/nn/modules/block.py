@@ -2952,3 +2952,69 @@ class AFPNFuse(nn.Module):
         w = torch.relu(self.weights)
         norm = w.sum() + self.eps
         return sum(wi * xi for wi, xi in zip(w, x)) / norm
+
+
+class Add(nn.Module):
+    """Element-wise sum fusion for multiple feature maps."""
+
+    def forward(self, xs: list[torch.Tensor]) -> torch.Tensor:
+        """Forward pass that sums input tensors."""
+        return torch.sum(torch.stack(xs), dim=0)
+
+
+class _CSPLayer2(nn.Module):
+    """CSP layer variant used by RepNCSPELAN5."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 1.0):
+        """Initialize _CSPLayer2.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of RepConv blocks.
+            e (float): Expansion ratio for hidden channels.
+        """
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * c_, 1, 1)
+        self.m = nn.Sequential(*(RepConv(c_, c_) for _ in range(n)))
+        self.cv2 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through _CSPLayer2."""
+        y = list(self.cv1(x).chunk(2, 1))
+        return self.cv2(y[0] + self.m(y[1]))
+
+
+class RepNCSPELAN5(nn.Module):
+    """DEIM-style RepNCSPELAN fusion block."""
+
+    def __init__(self, c1: int, c2: int, c3: int, c4: int, n: int = 1, e: float = 1.0):
+        """Initialize RepNCSPELAN5.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            c3 (int): Intermediate channels before split.
+            c4 (int): Hidden channels used by CSP branches.
+            n (int): Number of RepConv blocks per CSP branch.
+            e (float): Expansion ratio for CSP hidden channels.
+        """
+        super().__init__()
+        self.c = c3 // 2
+        self.cv1 = Conv(c1, c3, 1, 1)
+        self.cv2 = _CSPLayer2(c3 // 2, c4, n, e)
+        self.cv3 = _CSPLayer2(c4, c4, n, e)
+        self.cv4 = Conv(c3 + (2 * c4), c2, 1, 1)
+
+    def forward_chunk(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using chunk()."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in (self.cv2, self.cv3))
+        return self.cv4(torch.cat(y, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using split()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in (self.cv2, self.cv3))
+        return self.cv4(torch.cat(y, 1))
