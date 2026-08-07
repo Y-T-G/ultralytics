@@ -133,6 +133,7 @@ from .head import (
     DetectNorm,
     DetectROI,
     DetectSeed,
+    DetectSharedFPN,
     DetectSharedReg,
     DetectTA,
     LRPCHead,

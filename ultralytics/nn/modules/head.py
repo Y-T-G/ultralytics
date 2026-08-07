@@ -662,6 +662,26 @@ class DetectSharedReg(Detect):
         self.cv3 = None
 
 
+class DetectSharedFPN(Detect):
+    """FPN-shared detection towers (RetinaNet/FCOS style): every level runs the same head weights.
+
+    Only the first conv of each tower stays per-level, since it adapts the level's channel count to the
+    tower width; all later convs and the final predictor are the same modules for P3/P4/P5. Sharing is by
+    module identity, so parameters, BN stats and fused weights exist once and gradients from all levels
+    accumulate into them.
+    """
+
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        """Initialize a standard head, then replace each level's post-stem convs with level 0's modules."""
+        super().__init__(nc, reg_max, end2end=end2end, ch=ch)
+        for tower in (self.cv2, self.cv3, getattr(self, "one2one_cv2", None), getattr(self, "one2one_cv3", None)):
+            if tower is None:
+                continue
+            tail = list(tower[0])[1:]
+            for i in range(1, self.nl):
+                tower[i] = nn.Sequential(tower[i][0], *tail)
+
+
 class DetectBoxContextFull(DetectBoxContext):
     """Same as DetectBoxContext but BOTH o2m and o2o cls branches receive box context.
 
