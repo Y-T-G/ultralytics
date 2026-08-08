@@ -134,6 +134,7 @@ from .head import (
     DetectROI,
     DetectSeed,
     DetectSharedFPN,
+    DetectSharedFPNBN,
     DetectSharedReg,
     DetectTA,
     LRPCHead,

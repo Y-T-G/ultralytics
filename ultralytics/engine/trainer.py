@@ -997,6 +997,13 @@ class BaseTrainer:
                     g[1][fullname] = param
                 else:  # weight (with decay)
                     g[0][fullname] = param
+        seen = set()
+        for x in g:  # weight-tied params alias under several names; keep one so they are stepped once
+            for k, v in list(x.items()):
+                if id(v) in seen:
+                    del x[k]
+                else:
+                    seen.add(id(v))
         if not use_muon:
             g = [x.values() for x in g[:3]]  # convert to list of params
 

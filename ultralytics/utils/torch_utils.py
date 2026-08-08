@@ -651,8 +651,10 @@ class ModelEMA:
 
             msd = unwrap_model(model).state_dict()  # model state_dict
             ema_v, model_v = [], []
+            seen = set()
             for k, v in self.ema.state_dict().items():
-                if v.dtype.is_floating_point:  # true for FP16 and FP32
+                if v.dtype.is_floating_point and v.data_ptr() not in seen:  # true for FP16 and FP32; skip tied aliases
+                    seen.add(v.data_ptr())
                     ema_v.append(v)
                     model_v.append(msd[k])
             if ema_v and TORCH_2_0 and (TORCH_2_4 or ema_v[0].device.type != "mps"):  # one kernel launch per op

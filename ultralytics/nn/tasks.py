@@ -92,6 +92,7 @@ from ultralytics.nn.modules import (
     DetectROI,
     DetectSeed,
     DetectSharedFPN,
+    DetectSharedFPNBN,
     DetectSharedReg,
     DetectTA,
     DWConv,
@@ -2074,6 +2075,7 @@ def parse_model(d, ch, verbose=True):
                 DetectROI,
                 DetectSeed,
                 DetectSharedFPN,
+                DetectSharedFPNBN,
                 DetectSharedReg,
                 DetectTA,
                 WorldDetect,
@@ -2107,6 +2109,7 @@ def parse_model(d, ch, verbose=True):
                 DetectROI,
                 DetectSeed,
                 DetectSharedFPN,
+                DetectSharedFPNBN,
                 DetectSharedReg,
                 DetectTA,
                 YOLOEDetect,
@@ -2120,7 +2123,7 @@ def parse_model(d, ch, verbose=True):
                 OBB26,
             }:
                 m.legacy = legacy
-            if m in {Detect, DetectBoxContext, DetectBoxContextFull, DetectBoxContextFullSep, DetectBoxContextSep, DetectDGQP, DetectFDR, DetectFDRC, DetectFDRQ, DetectFGL, DetectGC, DetectNorm, DetectROI, DetectSeed, DetectSharedFPN, DetectSharedReg, DetectTA}:
+            if m in {Detect, DetectBoxContext, DetectBoxContextFull, DetectBoxContextFullSep, DetectBoxContextSep, DetectDGQP, DetectFDR, DetectFDRC, DetectFDRQ, DetectFGL, DetectGC, DetectNorm, DetectROI, DetectSeed, DetectSharedFPN, DetectSharedFPNBN, DetectSharedReg, DetectTA}:
                 m.suppress = suppress
                 m.rep_head = rep_head
                 m.o2o_dilated = o2o_dilated

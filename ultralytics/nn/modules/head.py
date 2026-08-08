@@ -671,15 +671,46 @@ class DetectSharedFPN(Detect):
     accumulate into them.
     """
 
+    per_level_bn = False  # keep each level's own BN (RetinaNet/FCOS style) and tie only the conv weights
+
     def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
         """Initialize a standard head, then replace each level's post-stem convs with level 0's modules."""
         super().__init__(nc, reg_max, end2end=end2end, ch=ch)
         for tower in (self.cv2, self.cv3, getattr(self, "one2one_cv2", None), getattr(self, "one2one_cv3", None)):
             if tower is None:
                 continue
-            tail = list(tower[0])[1:]
-            for i in range(1, self.nl):
-                tower[i] = nn.Sequential(tower[i][0], *tail)
+            if self.per_level_bn:
+                for i in range(1, self.nl):
+                    for a, b in zip(tower[i][1:].modules(), tower[0][1:].modules()):
+                        if isinstance(a, nn.Conv2d):
+                            a.weight = b.weight
+                            if a.bias is not None:
+                                a.bias = b.bias
+            else:
+                tail = list(tower[0])[1:]
+                for i in range(1, self.nl):
+                    tower[i] = nn.Sequential(tower[i][0], *tail)
+
+    def bias_init(self):
+        """Initialize the shared predictors once; the cls prior uses the middle level's stride."""
+        s = self.stride[self.nl // 2]
+        heads = [self.one2many]
+        if self.end2end and not self.o2o_residual_head and not self.o2o_pss:
+            heads.append(self.one2one)
+        for h in heads:
+            self._box_bias(h["box_head"][0][-1].bias)
+            h["cls_head"][0][-1].bias.data[: self.nc] = math.log(5 / self.nc / (640 / s) ** 2)
+
+
+class DetectSharedFPNBN(DetectSharedFPN):
+    """FPN-shared head that keeps per-level BatchNorm: only the conv weights are tied across P3/P4/P5.
+
+    RetinaNet and FCOS share head weights but not the normalization, because stride 8/16/32 features have
+    different statistics. Convs alias one weight tensor here, so the optimizer and EMA must skip the
+    duplicate aliases (handled by id-dedup in `build_optimizer` and `ModelEMA.update`).
+    """
+
+    per_level_bn = True
 
 
 class DetectBoxContextFull(DetectBoxContext):
