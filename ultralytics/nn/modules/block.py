@@ -2273,11 +2273,11 @@ class HGBottleneck(nn.Module):
     instead of `c`, and the block pays one squeeze instead of one residual add per conv.
     """
 
-    def __init__(self, c: int, n: int = 2, e: float = 0.5, shortcut: bool = True, rep: bool = False):
+    def __init__(self, c: int, n: int = 2, e: float = 0.5, shortcut: bool = True, rep: bool = False, g: int = 1):
         """Initialize with `n` inner convs of width `c * e` (RepConv when `rep`)."""
         super().__init__()
         cm = int(c * e)
-        block = (lambda a, b: RepConv(a, b, bn=a == b)) if rep else (lambda a, b: Conv(a, b, 3))
+        block = (lambda a, b: RepConv(a, b, bn=a == b, g=g)) if rep else (lambda a, b: Conv(a, b, 3, g=g))
         self.m = nn.ModuleList(block(c if i == 0 else cm, cm) for i in range(n))
         self.sc = Conv(c + n * cm, c, 1)
         self.add = shortcut
@@ -2306,9 +2306,16 @@ class C3k2HG(C2f):
         g: int = 1,
         shortcut: bool = True,
     ):
-        """Initialize C3k2HG; `hg_n`/`hg_e` set the inner conv count and width of each HGBottleneck."""
+        """Initialize C3k2HG; `hg_n`/`hg_e` set the inner conv count and width of each HGBottleneck.
+
+        `c3k` stacks two HGBottlenecks per site, matching the longest conv path of the C3k block that
+        stock C3k2 uses there (the parser forces `c3k=True` at m and above).
+        """
         super().__init__(c1, c2, n, shortcut, g, e)
-        self.m = nn.ModuleList(HGBottleneck(self.c, hg_n, hg_e, shortcut, rep) for _ in range(n))
+        self.m = nn.ModuleList(
+            nn.Sequential(*(HGBottleneck(self.c, hg_n, hg_e, shortcut, rep, g) for _ in range(2 if c3k else 1)))
+            for _ in range(n)
+        )
 
 
 class AgentAttn(nn.Module):

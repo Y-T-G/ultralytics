@@ -4,50 +4,60 @@
 # Variant: sres + strip with PP-HGNet(V2) aggregation blocks (`C3k2HG`) in place of C3k2's
 # Bottleneck. HGNet's finding is that latency does not track FLOPs: a Bottleneck is a narrow-deep
 # serial `3x3 -> 3x3 -> add` with low arithmetic intensity, while HGNet keeps every intermediate,
-# concatenates once and squeezes with a 1x1, so depth costs `cm = c * hg_e` channels and the block
-# pays one aggregation instead of a residual add per conv.
-# Inner shape per block: hg_n=2 convs at hg_e=0.5, picked by sweep (larger hg_n or hg_e always lost
-# speed). Layer 24 keeps C3k2 because of its PSA attention arg.
+# concatenates once and squeezes with a 1x1, so depth costs `cm = c * hg_e` channels.
 #
-# Bench, b16/b32 fp16 fused, RTX PRO 6000, interleaved median-of-3, vs same-scale yolo26 baseline:
-#   scale  variant     b16            b32            params    GFLOPs
-#   s      yolo26s     2176           2341            9.50M     20.7
-#   s      c3k2-strip  2075 (-4.7%)   2253 (-3.8%)   10.16M     20.7
-#   s      rep-strip   1889 (-13.2%)  1876 (-19.9%)  11.05M     28.4   <- current s champion
-#   s      THIS        2159 (-0.8%)   2274 (-2.9%)    9.89M     20.1
-#   m      yolo26m      993           1026           20.41M     68.2
-#   m      c3k2-strip   968 (-2.5%)   1000 (-2.6%)   21.47M     68.2   <- current m pick
-#   m      THIS        1031 (+3.8%)   1041 (+1.5%)   20.79M     65.3
-# So HG is +14.3% over the s champion at 10% fewer params, and +6.5% over the m pick.
-# Rejected in the same sweep: hg_e 0.75/1.0, hg_n 3/4 (all slower than baseline at both scales),
-# and a wide-shallow rep control (bb_e .375/neck_e .75: -20.6% at m, dense rep cost is quadratic).
-# mAP is untested: the s champion spends 28.4 GFLOPs, this spends 20.1, so treat a small loss as
-# expected and compare against the speed it buys back.
+# Per-scale constants (scale_args): `hg_n` = convs per block (the block's conv depth) and `hg_e` =
+# their width. Stock C3k2 uses a Bottleneck (depth 2) at n/s and is forced to C3k (longest conv
+# path 4) at m and above, so the depth-matched HG setting differs by scale:
+#   n/s: hg_n=2 hg_e=0.5  (depth 2, matches Bottleneck; shallow scales do not need more)
+#   m+ : hg_n=4 hg_e=0.25 (depth 4, matches C3k, at a quarter width)
+# `c3k` stays False at every site here: with C3k2HG depth is `hg_n`, and stacking two blocks
+# (`c3k=True`) measured -6.7% at m, well under baseline.
+#
+# Bench: b16/b32 fp16 fused, RTX PRO 6000, 7 paired rounds, randomized order, device-scoped sync.
+#   scale  variant        b16            b32            params    GFLOPs
+#   s      yolo26s        2184           2341            9.50M     20.7
+#   s      c3k2-strip     2094 (-4.1%)   2257 (-3.6%)   10.16M     20.8
+#   s      rep-strip      1884 (-13.7%)  1878 (-19.8%)  11.05M     28.5   <- current s champion
+#   s      THIS n2 e.5    2170 (-0.6%)   2278 (-2.7%)    9.89M     20.1
+#   s      (n4 e.25)      2085 (-4.5%)   2228 (-4.8%)    9.54M     19.1
+#   m      yolo26m         991           1024           20.41M     68.3
+#   m      c3k2-strip      965 (-2.6%)    999 (-2.4%)   21.47M     68.3   <- current m pick
+#   m      (n2 e.5)       1030 (+3.9%)   1041 (+1.7%)   20.79M     65.4
+#   m      THIS n4 e.25   1023 (+3.2%)   1044 (+2.0%)   19.95M     61.7
+# So at s this is +15.2% over the champion with 10% fewer params, and at m +6.0% over the c3k2
+# pick with 1.5M fewer params while keeping C3k's conv depth.
+# Rejected in the sweep: hg_e 0.75/1.0, hg_n 3, hg_n 4 at e.375, and `c3k=True` stacking (all below
+# baseline at one or both scales); a wide-shallow rep control (bb_e .375/neck_e .75) was -20.6% at m.
+# l/x reuse the m setting untested. mAP is untested at every scale: s drops 28.5 -> 20.1 GFLOPs, so
+# weigh any loss against the speed it returns.
 
 # Parameters
 nc: 80 # number of classes
 end2end: True # whether to use end-to-end mode
 reg_max: 1 # DFL bins
+scale_args: [hg_n, hg_e] # names for scales entries beyond [depth, width, max_channels]
 scales: # model compound scaling constants, i.e. 'model=yolo26n.yaml' will call yolo26.yaml with scale 'n'
-  # [depth, width, max_channels]
-  s: [0.50, 0.50, 1024]
-  m: [0.50, 1.00, 512]
-  l: [1.00, 1.00, 512]
-  x: [1.00, 1.50, 512]
+  # [depth, width, max_channels, hg_n, hg_e]
+  n: [0.50, 0.25, 1024, 2, 0.5]
+  s: [0.50, 0.50, 1024, 2, 0.5] # depth 2 = Bottleneck depth
+  m: [0.50, 1.00, 512, 4, 0.25] # depth 4 = C3k longest path, quarter width
+  l: [1.00, 1.00, 512, 4, 0.25] # untested
+  x: [1.00, 1.50, 512, 4, 0.25] # untested
 
 # YOLO26n backbone
 backbone:
   # [from, repeats, module, args]
   - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
   - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
-  - [-1, 2, C3k2HG, [256, False, 0.25, 2, 0.5]] # 2
+  - [-1, 2, C3k2HG, [256, False, 0.25, hg_n, hg_e]] # 2
   - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
-  - [-1, 2, C3k2HG, [512, False, 0.25, 2, 0.5]] # 4
+  - [-1, 2, C3k2HG, [512, False, 0.25, hg_n, hg_e]] # 4
   - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
-  - [-1, 2, C3k2HG, [512, True, 0.5, 2, 0.5]]
+  - [-1, 2, C3k2HG, [512, False, 0.5, hg_n, hg_e]]
   - [-1, 1, StripAttn, []] # 7 - strip gate at P4
   - [-1, 1, Conv, [1024, 3, 2]] # 8-P5/32
-  - [-1, 2, C3k2HG, [1024, True, 0.5, 2, 0.5]]
+  - [-1, 2, C3k2HG, [1024, False, 0.5, hg_n, hg_e]]
   - [-1, 1, SPPF, [1024, 5, 3, True]] # 10
   - [-1, 2, C2PSA, [1024]] # 11
   - [-1, 1, StripAttn, []] # 12 - strip gate at P5
@@ -56,13 +66,13 @@ backbone:
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 7], 1, Concat, [1]]
-  - [-1, 2, C3k2HG, [512, True, 0.5, 2, 0.5]] # 15
+  - [-1, 2, C3k2HG, [512, False, 0.5, hg_n, hg_e]] # 15
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 4], 1, Concat, [1]]
-  - [-1, 2, C3k2HG, [256, True, 0.5, 2, 0.5]] # 18
+  - [-1, 2, C3k2HG, [256, False, 0.5, hg_n, hg_e]] # 18
   - [-1, 1, Conv, [256, 3, 2]]
   - [[-1, 15], 1, Concat, [1]]
-  - [-1, 2, C3k2HG, [512, True, 0.5, 2, 0.5]] # 21
+  - [-1, 2, C3k2HG, [512, False, 0.5, hg_n, hg_e]] # 21
   - [-1, 1, Conv, [512, 3, 2]]
   - [[-1, 12], 1, Concat, [1]]
   - [-1, 1, C3k2, [1024, True, 0.5, True]] # 24
