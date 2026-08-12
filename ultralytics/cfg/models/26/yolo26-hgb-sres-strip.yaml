@@ -7,10 +7,17 @@
 # concatenates once and squeezes with a 1x1, so depth costs `cm = c * hg_e` channels.
 #
 # Per-scale constants (scale_args): `hg_n` = convs per block (the block's conv depth) and `hg_e` =
-# their width. Stock C3k2 uses a Bottleneck (depth 2) at n/s and is forced to C3k (longest conv
-# path 4) at m and above, so the depth-matched HG setting differs by scale:
-#   n/s: hg_n=2 hg_e=0.5  (depth 2, matches Bottleneck; shallow scales do not need more)
-#   m+ : hg_n=4 hg_e=0.25 (depth 4, matches C3k, at a quarter width)
+# their width:
+#   n/s: hg_n=2 hg_e=0.5  (depth 2)
+#   m+ : hg_n=4 hg_e=0.25 (depth 4)
+# Depth comparison, stated precisely. At s the rep champion uses C3k2Rep, whose c3k=True sites are
+# two stacked RepConvs, so its depth is 2 at layers 6/9/15/18/21 and 1 at layers 2/4: hg_n=2 matches
+# or exceeds it everywhere. Stock C3k2 at s is deeper, using C3k (longest conv path 4) at those five
+# sites, so this config is shallower than C3k2-at-s there. At m and above the parser forces c3k on
+# C3k2, so every site is a C3k and hg_n=4 matches that path length.
+# Depth is matched at m+, capacity is not: per unit of outer hidden width C, an HG n4/e.25 block
+# holds ~5.94*C^2 conv weights against C3k's ~11*C^2, about 54%. That is the trade this config makes
+# and the most likely place COCO AP goes missing.
 # `c3k` stays False at every site here: with C3k2HG depth is `hg_n`, and stacking two blocks
 # (`c3k=True`) measured -6.7% at m, well under baseline.
 #
@@ -29,6 +36,10 @@
 # pick with 1.5M fewer params while keeping C3k's conv depth.
 # Rejected in the sweep: hg_e 0.75/1.0, hg_n 3, hg_n 4 at e.375, and `c3k=True` stacking (all below
 # baseline at one or both scales); a wide-shallow rep control (bb_e .375/neck_e .75) was -20.6% at m.
+# Also measured at s, per-site mixed depth (hg_n 2 at the plain sites, deeper at the C3k sites, so
+# depth matches stock C3k2-at-s everywhere): 4/.25 = 2120 img/s (-2.5%, 9.55M), 3/.375 = 2126
+# (-2.2%, 9.80M), 4/.375 = 2065 (-5.0%). All still beat the rep champion by 10-13%, so mixed depth
+# is the fallback if flat hg_n=2 loses AP at s.
 # l/x reuse the m setting untested. mAP is untested at every scale: s drops 28.5 -> 20.1 GFLOPs, so
 # weigh any loss against the speed it returns.
 

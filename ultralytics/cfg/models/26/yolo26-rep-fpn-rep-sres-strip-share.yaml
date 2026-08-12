@@ -43,7 +43,12 @@
 # stay per-branch, so both losses train the same tower convs.
 # Sharing was the most consistently positive mechanism in HEAD_EXPERIMENTS.md (7/7 matched pairs
 # positive, mean +0.169) and `det-w2share` was the one variant whose o2m was still climbing at
-# epoch 60 instead of decaying. Inference graph is unchanged: after fuse only the o2o branch remains.
+# epoch 60 instead of decaying. The base-width control `det-share` gained only +0.082 over
+# `det-base`, which is under that sweep's own noise floor, so this run is the real test.
+# It is not a pure weight-sharing ablation: the shared towers run twice per training batch, so their
+# BatchNorm running stats update twice per step and unique tower capacity halves.
+# Deployment is unaffected: fuse() drops cv2/cv3, leaving an o2o tower with the same operators,
+# shapes and parameter count as the champion (11,045,309 fused).
 
 # Parameters
 nc: 80 # number of classes

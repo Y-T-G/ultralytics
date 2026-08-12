@@ -39,11 +39,15 @@
 # by its head count. Clean neck_e values: 0.375, 0.5.
 
 # Variant: strip champion + the DW9 box tower from the `det-w2drk` head experiment, WITHOUT its
-# width increase. The head run paired `box_dilated: 9` with head_c2 192 / fixed_c3 384 (3x the auto
-# widths at s), which cost +38% GFLOPs and 12.85M params. Here only the dilated-reparam box tower is
-# kept, so the head keeps its stock widths and the deployed graph stays close to the champion's.
-# `det-w2drk` scored 45.61 o2o / 46.06 o2m at the lowest latency of the head ladder (0.72 ms).
-# This isolates whether the DW9 box tower carries any of that on its own.
+# width increase. The head run paired `box_dilated: 9` with head_c2 192 / fixed_c3 384, which at
+# YOLO26s (reg_max=1) is 6x the auto box width of 32 and 3x the auto cls width of 128, and cost +38%
+# GFLOPs and 12.85M params. Here only the dilated-reparam box tower is kept, so the head keeps its
+# stock widths. Note this replaces the first P4/P5 dense 3x3 with 1x1 + DW9 rather than only adding
+# dilation, and the 1x1 mixer is 32 channels wide here against 192 in `det-w2drk`, so the
+# factorization has much less width to work with.
+# Ladder results: `det-w2drk` 45.61 o2o / 46.06 o2m at the ladder's lowest latency (0.72 ms), and the
+# base-width control `det-drk` 44.850 vs `det-base` 44.598 (+0.252). Both were frozen-backbone runs
+# at a different epoch budget, so they motivate this test, they do not predict it.
 
 # Parameters
 nc: 80 # number of classes
