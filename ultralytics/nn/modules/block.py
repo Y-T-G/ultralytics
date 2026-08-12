@@ -2265,6 +2265,52 @@ class C3k2Rep(C2fRep):
             )
 
 
+class HGBottleneck(nn.Module):
+    """PP-HGNet(V2) aggregation block: n dense convs, one concat, one 1x1 squeeze back to c.
+
+    Replaces the Bottleneck's narrow-deep `3x3 -> 3x3 -> add` with HGNet's wide-shallow shape: every
+    intermediate feature is kept and reused through a single concat, so depth costs `cm` channels
+    instead of `c`, and the block pays one squeeze instead of one residual add per conv.
+    """
+
+    def __init__(self, c: int, n: int = 2, e: float = 0.5, shortcut: bool = True, rep: bool = False):
+        """Initialize with `n` inner convs of width `c * e` (RepConv when `rep`)."""
+        super().__init__()
+        cm = int(c * e)
+        block = (lambda a, b: RepConv(a, b, bn=a == b)) if rep else (lambda a, b: Conv(a, b, 3))
+        self.m = nn.ModuleList(block(c if i == 0 else cm, cm) for i in range(n))
+        self.sc = Conv(c + n * cm, c, 1)
+        self.add = shortcut
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Aggregate every inner conv output with the input, then squeeze back to c channels."""
+        y = [x]
+        y.extend(m(y[-1]) for m in self.m)
+        y = self.sc(torch.cat(y, 1))
+        return y + x if self.add else y
+
+
+class C3k2HG(C2f):
+    """C3k2 with PP-HGNet aggregation blocks instead of Bottleneck."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        hg_n: int = 2,
+        hg_e: float = 0.5,
+        rep: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2HG; `hg_n`/`hg_e` set the inner conv count and width of each HGBottleneck."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(HGBottleneck(self.c, hg_n, hg_e, shortcut, rep) for _ in range(n))
+
+
 class AgentAttn(nn.Module):
     """Agent attention (ECCV 2024): pooled agent tokens bridge softmax and linear attention.
 
