@@ -316,8 +316,10 @@ class BaseTrainer:
                     except StopIteration:
                         loader = iter(self.train_loader)
                         batch = next(loader)
-                    loss, _ = self.forward_batch(batch)
-                    total += loss.detach() / len(batch["img"])  # per image, so the curve does not track the batch size
+                    loss, loss_items = self.forward_batch(batch)
+                    # the reported items, not the summed loss: they are batch size independent, and for an end to end
+                    # model they are the one to one branch, whose share of the objective grows as training proceeds
+                    total += loss_items.detach().sum()
                     self.scaler.scale(loss).backward()
             except RuntimeError as e:
                 if self.world_size > 1:
@@ -473,6 +475,7 @@ class BaseTrainer:
         self._setup_scheduler()
         if auto and not self.resume and not scratch:
             self._find_lr()
+        LOGGER.info(self.optimizer_info.format(lr=self.args.lr0))
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
         self.resume_training(ckpt)
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
@@ -1184,8 +1187,9 @@ class BaseTrainer:
             g = g_
         optimizer = getattr(optim, name, partial(MuSGD, muon=muon, sgd=sgd))(params=g)
 
-        LOGGER.info(
-            f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "
+        # logged by the caller, as a sweep may still replace the rate this was built with
+        self.optimizer_info = (
+            f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={{lr}}, momentum={momentum}) with parameter groups "
             f"{len(g[1]['params'])} weight(decay=0.0), {len(g[0]['params']) if len(g[0]) else len(g[3]['params'])} weight(decay={decay}), {len(g[2]['params'])} bias(decay=0.0)"
         )
         return optimizer
