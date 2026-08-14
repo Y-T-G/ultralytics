@@ -263,6 +263,115 @@ class BaseTrainer:
             world_size=self.world_size,
         )
 
+    def _find_lr(self, num_it: int = 100, lr_min: float = 1e-6, lr_max: float = 1.0):
+        """Fit 'lr0' and 'warmup_bias_lr' to the current model and dataset with a learning rate range test.
+
+        Sweeps the learning rate exponentially from lr_min to lr_max over at most num_it optimizer steps, capped so
+        the sweep stays under a tenth of the run, recording the training loss and stopping early once it exceeds four
+        times its minimum. The loss is read from a centered five step moving average, centered so the reading carries
+        none of the phase lag a trailing average would add. Two rates come out of that curve: the loss minimum, the
+        highest rate that still improved the loss, and the rate of fastest descent, where the loss drop per decade of
+        rate is largest. The descent velocity is concave around its maximum with the peak at the optimal rate
+        (https://arxiv.org/abs/2506.13274), so a local parabola fit refines it. Neither endpoint works alone. The
+        minimum sits above the rate a run can sustain, because the loss at each step reflects every lower rate that
+        preceded it and so registers damage late, while the peak is far enough below it to under-train. 'lr0'
+        therefore lands halfway between them in log space, capped at 0.01 because a range test reads one-step
+        stability and a full schedule tolerates less. 'warmup_epochs' falls
+        linearly with the gap between the two in decades, clipped to [1, 5] and calibrated so a typical 0.8 decade
+        gap reproduces the 3.0 epoch default: a narrow band between fastest descent and instability means a longer
+        ramp. That gap describes the loss curve alone, so it does not move with the choice of 'lr0' inside the band,
+        and it is only applied while 'warmup_epochs' still holds its default. 'warmup_bias_lr' becomes 'lr0', so
+        biases train at the fitted rate from the first step while every other group ramps up to it. Model, optimizer,
+        scaler and dataloader states are restored before returning, so training starts from the weights it would have
+        without the sweep.
+
+        Args:
+            num_it (int): Upper bound on the optimizer steps in the sweep, capped to a tenth of the run.
+            lr_min (float): Learning rate of the first step.
+            lr_max (float): Learning rate of the last step.
+        """
+        nb = len(self.train_loader) // self.accumulate  # optimizer steps per epoch
+        num_it = min(num_it, nb * self.epochs // 10)  # the sweep must not outweigh the training it configures
+        if nb < 10 or num_it < 50:  # too few unique batches to cycle, or too few points to fit a curve
+            LOGGER.info(f"{colorstr('LR finder:')} run too short to sweep, using the 'lr0' equation")
+            return
+        pg = self.optimizer.param_groups
+        base = min(g["lr"] for g in pg)
+        ratios = [g["lr"] / base for g in pg]  # per-group scaling to preserve, e.g. the MuSGD head boost
+        model_state = {k: v.detach().to("cpu", copy=True) for k, v in self.model.state_dict().items()}
+        optimizer_state, scaler_state = deepcopy(self.optimizer.state_dict()), self.scaler.state_dict()
+
+        self._model_train()
+        lrs = np.logspace(math.log10(lr_min), math.log10(lr_max), num_it)
+        losses, total, loader = [], torch.zeros(1, device=self.device), iter(self.train_loader)
+        desc = f"{colorstr('LR finder:')} sweeping lr {lr_min:g} -> {lr_max:g}"
+        for lr in TQDM(lrs, total=num_it, desc=desc) if RANK in {-1, 0} else lrs:
+            for g, r in zip(pg, ratios):
+                g["lr"] = lr * r
+            total.zero_()
+            try:
+                for _ in range(self.accumulate):
+                    try:
+                        batch = next(loader)
+                    except StopIteration:
+                        loader = iter(self.train_loader)
+                        batch = next(loader)
+                    loss, _ = self.forward_batch(batch)
+                    total += loss.detach() / len(batch["img"])  # per image, so the curve does not track the batch size
+                    self.scaler.scale(loss).backward()
+            except RuntimeError as e:
+                if self.world_size > 1:
+                    raise  # a rank that skips its backward would desynchronize the others
+                LOGGER.warning(f"{colorstr('LR finder:')} sweep stopped early, {e}")
+                self._clear_memory()
+                break
+            self.optimizer_step()
+            if self.world_size > 1:
+                dist.all_reduce(total)  # every rank fits the same global curve, so no result broadcast is needed
+            losses.append(total.item() / (self.accumulate * max(self.world_size, 1)))
+            if not math.isfinite(losses[-1]) or losses[-1] > 4 * min(losses):
+                break
+
+        self.model.load_state_dict(model_state)
+        self.optimizer.load_state_dict(optimizer_state)  # rebuilds param_groups, so re-bind pg below
+        self.scaler.load_state_dict(scaler_state)
+        self.ema = ModelEMA(self.model)  # discard the EMA the sweep steps accumulated
+        pg = self.optimizer.param_groups
+        self.train_loader.reset()  # restart the shuffled cycle the sweep consumed
+
+        n = 5  # centered moving average window, free of the phase lag a trailing average would add
+        if len(losses) < 3 * n:
+            LOGGER.warning(f"{colorstr('LR finder:')} sweep too short to fit, using the 'lr0' equation")
+            return
+        y = np.convolve(losses, np.ones(n) / n, mode="valid")
+        x = np.log10(lrs[n // 2 : n // 2 + len(y)])
+        edge = int(y.argmin())  # highest rate that still improved the loss, i.e. the edge of stability
+        if not 5 <= edge < len(y) - 1:  # the loss must fall and then turn back up inside the sweep
+            LOGGER.warning(f"{colorstr('LR finder:')} sweep did not bracket an optimum, using the 'lr0' equation")
+            return
+        v = -np.gradient(y[: edge + 1], x[: edge + 1])  # loss descent velocity, concave around its maximum
+        j, w = int(v.argmax()), max(edge // 8, 3)
+        if not 0 < j < edge:  # the velocity maximum must sit inside the descending region
+            LOGGER.warning(f"{colorstr('LR finder:')} sweep found no velocity peak, using the 'lr0' equation")
+            return
+        s = slice(max(j - w, 0), min(j + w + 1, edge + 1))
+        a, b, _ = np.polyfit(x[s], v[s], 2)  # refine the maximum with a local parabola fit
+        fastest = np.clip(-b / (2 * a) if a < 0 else x[j], x[0], x[edge])  # log10 rate of fastest descent
+        fit = (fastest + x[edge]) / 2  # halfway to the edge, too hot to train at alone
+
+        # a range test measures one-step stability, which runs hotter than a full schedule tolerates, so cap at the
+        # highest rate any shipped default uses
+        self.args.lr0 = self.args.warmup_bias_lr = lr = float(f"{min(10**fit, 0.01):.3g}")
+        if self.args.warmup_epochs == DEFAULT_CFG.warmup_epochs:  # leave a swept or hand-picked warmup alone
+            self.args.warmup_epochs = round(float(np.clip(5.0 - 2.5 * (x[edge] - fastest), 1.0, 5.0)), 1)
+        for g, r in zip(pg, ratios):
+            g["lr"] = g["initial_lr"] = lr * r
+        self._setup_scheduler()  # rebuild, as LambdaLR captured the pre-sweep initial_lr
+        LOGGER.info(
+            f"{colorstr('LR finder:')} fitted 'lr0={lr:g}', 'warmup_bias_lr={lr:g}' and "
+            f"'warmup_epochs={self.args.warmup_epochs:g}'"
+        )
+
     def _setup_train(self):
         """Build dataloaders and optimizer on correct rank process."""
         ckpt = self.setup_model()
@@ -340,6 +449,15 @@ class BaseTrainer:
                 self.plot_training_labels()
 
         # Optimizer
+        lr0 = str(self.args.lr0).lower()  # read before build_optimizer resolves 'auto' to a number
+        auto = lr0 == "auto" or str(self.args.optimizer).lower() == "auto"
+        # a range test reads the rate a fixed set of weights tolerates for one step, which a run starting from random
+        # weights cannot sustain for a full schedule, so those keep the hand-tuned defaults
+        scratch = self.args.pretrained is False or (
+            not str(self.args.model).endswith(".pt") and not isinstance(self.args.pretrained, (str, Path))
+        )
+        if scratch and lr0 == "auto":
+            self.args.lr0 = DEFAULT_CFG.lr0
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
         weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
         iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
@@ -353,6 +471,8 @@ class BaseTrainer:
         )
         # Scheduler
         self._setup_scheduler()
+        if auto and not self.resume and not scratch:
+            self._find_lr()
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
         self.resume_training(ckpt)
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
@@ -692,6 +812,26 @@ class BaseTrainer:
         self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
         return ckpt
 
+    def forward_batch(self, batch):
+        """Run one training forward pass.
+
+        Args:
+            batch (dict): Batch to preprocess and run through the model.
+
+        Returns:
+            loss (torch.Tensor): Summed loss to backpropagate, scaled by the world size under DDP.
+            loss_items (dict): Detached per-component losses, independent of the batch size.
+        """
+        with autocast(self.amp, device=self.device.type):
+            batch = self.preprocess_batch(batch)
+            if self.args.compile:
+                # Decouple inference and loss calculations for improved compile performance
+                preds = self.model(batch["img"])
+                loss, loss_items = unwrap_model(self.model).loss(batch, preds)
+            else:
+                loss, loss_items = self.model(batch)
+            return loss.sum() * (self.world_size if RANK != -1 else 1), loss_items
+
     def optimizer_step(self):
         """Perform a single step of the training optimizer with gradient clipping and EMA update."""
         self.scaler.unscale_(self.optimizer)  # unscale gradients
@@ -973,16 +1113,20 @@ class BaseTrainer:
         """
         g = [{}, {}, {}, {}]  # optimizer parameter groups
         bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
+        nc = self.data.get("nc", 10)  # number of classes
+        lr_fit = round(0.002 * 5 / (4 + nc), 6)  # lr0 fit equation to 6 decimal places
         if name == "auto":
             LOGGER.info(
                 f"{colorstr('optimizer:')} 'optimizer=auto' found, "
                 f"ignoring 'lr0={self.args.lr0}' and 'momentum={self.args.momentum}' and "
                 f"determining best 'optimizer', 'lr0' and 'momentum' automatically... "
             )
-            nc = self.data.get("nc", 10)  # number of classes
-            lr_fit = round(0.002 * 5 / (4 + nc), 6)  # lr0 fit equation to 6 decimal places
             name, lr, momentum = ("MuSGD", 0.01 if iterations > 10000 else lr_fit, 0.9)
             self.args.warmup_bias_lr = 0.0  # no higher than 0.01 for Adam
+            # Record the resolution so a rebuilt or resumed pipeline reuses it instead of fitting a second time
+            self.args.optimizer, self.args.lr0, self.args.momentum = name, lr, momentum
+        elif str(lr).lower().startswith("auto"):
+            self.args.lr0 = lr = lr_fit  # seeds the sweep and stands in for it if the fit is rejected
 
         use_muon = name == "MuSGD"
         for module_name, module in unwrap_model(model).named_modules():

@@ -356,6 +356,8 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
         - Fraction keys are checked to be within the range [0.0, 1.0].
     """
     for k, v in cfg.items():
+        if k == "lr0" and str(v).lower() == "auto":
+            continue  # the LR finder resolves these against the model and dataset at train time
         if v is not None:  # None values may be from optional args
             if k in CFG_FLOAT_KEYS and not isinstance(v, FLOAT_OR_INT):
                 if hard:
