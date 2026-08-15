@@ -340,19 +340,19 @@ class BaseTrainer:
         if not 5 <= edge < len(smooth_loss) - 1:  # the loss must fall and then turn back up inside the sweep
             LOGGER.warning(f"{prefix} sweep did not bracket an optimum, using the 'lr0' equation")
             return
-        # Back off a fixed 0.6 decades from the edge rather than a share of the band, whose low end is measured
-        # where the loss barely moves and so is noise. Against the tuned YOLO26 COCO recipes, which fine-tune the
-        # Objects365 checkpoints, this reproduces 'lr0' to 1.07x where a share of the band is out by 42x.
-        # Cap the one-step stability estimate at the highest rate any shipped schedule uses.
-        self.args.lr0 = self.args.warmup_bias_lr = lr = float(f"{min(10 ** (log_lrs[edge] - 0.6), 0.01):.3g}")
-        # Take the ramp from the band width, which needs a velocity peak inside the descending region to locate.
-        # A sweep that does not resolve one still fits every other setting, so this only skips 'warmup_epochs'.
         velocity = -np.gradient(smooth_loss[: edge + 1], log_lrs[: edge + 1])
         peak, radius = int(velocity.argmax()), max(edge // 8, 3)
-        if 0 < peak < edge and self.args.warmup_epochs == DEFAULT_CFG.warmup_epochs:
-            neighborhood = slice(max(peak - radius, 0), min(peak + radius + 1, edge + 1))
-            curvature, slope, _ = np.polyfit(log_lrs[neighborhood], velocity[neighborhood], 2)  # off the sample grid
-            fastest = np.clip(-slope / (2 * curvature) if curvature < 0 else log_lrs[peak], log_lrs[0], log_lrs[edge])
+        if not 0 < peak < edge:  # the velocity maximum must sit inside the descending region
+            LOGGER.warning(f"{prefix} sweep found no velocity peak, using the 'lr0' equation")
+            return
+        # Interpolate the velocity peak so the fit is not limited to one of the sampled rates.
+        neighborhood = slice(max(peak - radius, 0), min(peak + radius + 1, edge + 1))
+        curvature, slope, _ = np.polyfit(log_lrs[neighborhood], velocity[neighborhood], 2)
+        fastest = np.clip(-slope / (2 * curvature) if curvature < 0 else log_lrs[peak], log_lrs[0], log_lrs[edge])
+        # Cap the one-step stability estimate at the highest learning rate used by a shipped schedule.
+        self.args.lr0 = self.args.warmup_bias_lr = lr = float(f"{min(10 ** ((fastest + log_lrs[edge]) / 2), 0.01):.3g}")
+        # Preserve explicit warmup settings; narrower stable bands need a longer ramp.
+        if self.args.warmup_epochs == DEFAULT_CFG.warmup_epochs:
             self.args.warmup_epochs = round(float(np.clip(5.0 - 2.5 * (log_lrs[edge] - fastest), 1.0, 5.0)), 1)
         # Anneal to a fixed final rate rather than a fixed fraction of 'lr0', which would stall a run whose fitted
         # 'lr0' is well under the default. The tuned YOLO26 recipes end within 12% of 3e-4 across a 14x range of
