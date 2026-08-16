@@ -2001,7 +2001,7 @@ class RefineDetect(Detect):
             cls, box = (torch.cat([branch[i][t](feats[i]).flatten(2) for i in range(self.nl)], dim=-1) for t in (0, 1))
             scores = scores.index_add(1, index, cls)
             gate = scores.index_select(1, index).sigmoid().amax(1, keepdim=True).detach()
-            boxes = boxes + gate * box
+            boxes = boxes + box + (gate - 1) * box.detach()  # gate scales the delta, never its gradient
         preds["scores"], preds["boxes"] = scores, boxes
         return preds
 
