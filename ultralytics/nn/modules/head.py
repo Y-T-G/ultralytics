@@ -2000,7 +2000,8 @@ class RefineDetect(Detect):
             tuned = scores.index_select(1, index).amax(1, keepdim=True)
             lead = tuned - scores.amax(1, keepdim=True)  # 0 where a refined class wins the anchor, negative otherwise
             gate = (tuned.sigmoid() * lead.sigmoid()).detach()  # the refined classes must both fire and win
-            boxes = boxes + gate * r[:, nr:]
+            box = r[:, nr:]  # the gate is near zero until they score, so floor it on the backward pass to train at all
+            boxes = boxes + gate * box.detach() + gate.clamp(min=0.1) * (box - box.detach())
         preds["scores"], preds["boxes"] = scores, boxes
         return preds
 
