@@ -110,7 +110,7 @@ Label files only need boxes for the classes you tune. Everything else is ignored
 
 ## What Changes in the Model
 
-The detection head gains a small refinement branch, one per detection level, built from the same depthwise blocks as the existing classification branch, a quarter as wide and twice as deep. It predicts a class score adjustment for the tuned classes and a box adjustment gated by their confidence, and starts zero-initialized so an attached model predicts exactly what it did before training.
+The detection head gains a small refinement branch, one per detection level, holding a class tower and a box tower built from the same depthwise blocks as the existing classification branch, a quarter as wide and twice as deep. It predicts a class score adjustment for the tuned classes and a box adjustment gated by their confidence, and starts zero-initialized so an attached model predicts exactly what it did before training.
 
 Everything else is frozen, including [batch normalization](https://www.ultralytics.com/glossary/batch-normalization) statistics. The classification output rows of the untuned classes are restored after every optimizer step, so weight decay and momentum cannot move them either.
 
@@ -118,9 +118,9 @@ The cost for one added class, measured at 640 pixels after `fuse`:
 
 | Model                                                          | Parameters       | GFLOPs |
 | -------------------------------------------------------------- | ---------------- | ------ |
-| [YOLO26n](https://platform.ultralytics.com/ultralytics/yolo26) | 2.42M to 2.47M   | +1.7%  |
-| [YOLO26s](https://platform.ultralytics.com/ultralytics/yolo26) | 9.51M to 9.68M   | +1.5%  |
-| [YOLO26m](https://platform.ultralytics.com/ultralytics/yolo26) | 20.44M to 20.72M | +1.3%  |
+| [YOLO26n](https://platform.ultralytics.com/ultralytics/yolo26) | 2.41M to 2.50M   | +3.4%  |
+| [YOLO26s](https://platform.ultralytics.com/ultralytics/yolo26) | 9.50M to 9.83M   | +3.1%  |
+| [YOLO26m](https://platform.ultralytics.com/ultralytics/yolo26) | 20.41M to 20.98M | +2.7%  |
 
 The result is a normal checkpoint. [Prediction](../modes/predict.md), [validation](../modes/val.md) and [export](../modes/export.md) all work as usual.
 
@@ -163,8 +163,8 @@ model.train(data="rhino.yaml", epochs=30, classes=[80], trainer=RefineDetectionT
 | `rhino` mAP50                                 | 0.747   |
 | `rhino` mAP50-95                              | 0.672   |
 | COCO class score max change vs the base model | 5.7e-14 |
-| Params                                        | +2.0%   |
-| GFLOPs                                        | +1.7%   |
+| Params                                        | +3.8%   |
+| GFLOPs                                        | +3.4%   |
 
 The score change is floating point noise, so the 80 COCO classes predict exactly what they did before. Detections on four images from the set are below.
 
@@ -267,7 +267,7 @@ model = YOLO("runs/detect/train/weights/best.pt")
 model.train(data="data-2.yaml", epochs=50, classes=[81], trainer=RefineDetectionTrainer)
 ```
 
-Every session adds a branch that stays in the model forever, and the cost adds up. On YOLO26n each branch is about **+2.0% parameters** and **+1.7% GFLOPs**, so three sessions land near +6% parameters and +5% GFLOPs, while one session tuning three classes costs the same as one session tuning one. The branch width does not depend on how many classes it refines, only the output convolution does.
+Every session adds a branch that stays in the model forever, and the cost adds up. On YOLO26n each branch is about **+3.8% parameters** and **+3.4% GFLOPs**, so three sessions land near +11% parameters and +10% GFLOPs, while one session tuning three classes costs the same as one session tuning one. The branch width does not depend on how many classes it refines, only the output convolution does.
 
 Pass the classes together as `classes=[80, 81]` whenever you know them up front, and keep stacking for classes that genuinely arrive later.
 
