@@ -110,11 +110,11 @@ Label files only need boxes for the classes you tune. Everything else is ignored
 
 ## What Changes in the Model
 
-The detection head gains a small refinement branch, one per detection level, built from the same depthwise blocks as the existing classification branch, a quarter as wide and twice as deep. It predicts a class score adjustment for the tuned classes and a box adjustment gated by their confidence, and starts zero-initialized so an attached model predicts exactly what it did before training.
+The detection head gains a small refinement branch, one per detection level, built from the same depthwise blocks as the existing classification branch, a quarter as wide and twice as deep. It predicts a class score adjustment for the tuned classes and a box adjustment gated by how far they lead the anchor, and starts zero-initialized so an attached model predicts exactly what it did before training.
 
 Everything else is frozen, including [batch normalization](https://www.ultralytics.com/glossary/batch-normalization) statistics. The classification output rows of the untuned classes are restored after every optimizer step, so weight decay and momentum cannot move them either.
 
-The guarantee covers class scores. A single box is predicted per anchor and shared by every class, so the box adjustment can move a box on an anchor where a tuned class is confident. The confidence gate scales that adjustment down to nothing on the anchors where no tuned class fires.
+The guarantee covers class scores. A single box is predicted per anchor and shared by every class, so the box adjustment can move a box on an anchor that a tuned class wins. The gate scales that adjustment down to nothing everywhere else, and a tuned class has to both fire on an anchor and outscore every other class there to move its box.
 
 The cost for one added class, measured at 640 pixels after `fuse`:
 
@@ -250,7 +250,7 @@ The table above reports each run's best saved checkpoint, which is what you woul
 
 ### Are the other classes really unchanged?
 
-Their class scores are bit-identical. Boxes are shared by every class, so the box adjustment can shift a box on the few anchors where a tuned class is confident. Class predictions are never affected.
+Their class scores are bit-identical. Boxes are shared by every class, so the box adjustment can shift a box on the few anchors that a tuned class wins. Class predictions are never affected.
 
 ### How many images do I need?
 
