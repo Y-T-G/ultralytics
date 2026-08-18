@@ -1,0 +1,103 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Ultralytics YOLO26 object detection model with P3/8 - P5/32 outputs
+# Variant: rep-fpn-rep-sres with strip-pooling attention (SPNet/ZipDepth) at backbone
+# P4 (new) and P5 (after C2PSA). Global axial context via H/W strip pooling + symmetric
+# sigmoid gate; near-zero cost (O(C^2*(H+W))).
+# Per-scale constants (scale_args): `rep_e` = rep-block expansion (dense RepConv cost
+# grows as (c2*width*rep_e)^2, so wider scales use smaller rep_e) and `head_n` = FPN
+# head repeats for layers 15/18 (baseline yolo26 uses 2). Values from a joint
+# head_n x rep_e sweep = max capacity with speed >= same-scale yolo26 baseline
+# (interleaved median-of-3+, b16 fp16, fused, GPU 3). Constraints found:
+# - rep width (c2*width*rep_e) should be a multiple of 16 (tensor-core alignment;
+#   x at 264ch collapsed to 375 img/s)
+# - head attn channels must divide PSABlock num_heads=c//64 (e=0.4375 at l/x -> 336ch,
+#   5 heads, crash)
+#
+# Joint sweep results (b16 fp16, img/s, vs same-scale yolo26 baseline):
+#   scale  pick            params(fused)  GFLOPs   this   base   margin  runner-up
+#   n      d2 e0.5          2.7M            6.8    3633   3736   -2.8%   d3 e0.5: 3458
+#   s      d3 e0.5         11.0M           28.4    (trained champion, mAP 0.4788 vs 0.4755)
+#   m      bb.25/nk.5 d2   22.6M                   1008    965   +4.4%   see m v2 note below
+#   l      d2 e0.3125      24.1M           93.3     801    780   +2.7%   d3 e0.3125: 773 (fails)
+#   x      d3 e0.3125      55.7M          217.2     450    438   +2.7%   d2 e0.375: 397 (fails)
+# n still cannot reach baseline: depth-2 head recovers 5% of the 7.4% gap, the last
+# -2.8% is the strip convs + non-bottleneck rep blocks at tiny width.
+#
+# m v2 (2026-07-23): uniform rep_e=0.28125 h_n=3 trained -0.83 mAP vs yolo26m at ep45
+# (capacity-starved: 144/72ch dense rep everywhere; 72 also breaks mult-of-16). Fix =
+# split bb_e/neck_e like yolo26.yaml (backbone 0.25, neck 0.5): cheap backbone at large
+# spatial, wide dense rep (256/128ch) in the neck where large-object capacity lives.
+# Interleaved bench b16 fp16 GPU7: base 965/995, m-v2 1008 (+4.4%), C3k2-swap variants
+# 970-1009 but less capacity, uniform e0.375 931, bb-rep+C3k2-head-e.375 996.
+# l/x re-swept with the split (2026-07-23, GPU 4 interleaved, xstrip paused):
+#   l: bb.25/nk.5/d2 = 813 (+3.1%, 29.4M) beats .25/.375/d2 = 854 (+8.3%) on capacity;
+#      uniform .3125 = 804 (24.1M) dominated.
+#   x: bb.25/nk.375/d3 = 455 (+3.7%, 59.0M); nk.5 fails budget (432/-1.6% d2, 409/-6.9% d3);
+#      uniform .3125 = 449 (55.7M) dominated.
+# neck_e=0.4375 is INVALID at l/x: layer-24 PSABlock hidden (224/336ch) not divisible
+# by its head count. Clean neck_e values: 0.375, 0.5.
+
+# Variant: triplesa plus a fourth P5 residual from layer 9, the C3k2 block before SPPF, so the
+# detect P5 branch can tap every stage of the P5 stack:
+#   12 StripAttn  gated, the champion's own residual
+#   11 C2PSA      ungated attention output, +0.84 AP-S as `-cleansa`
+#   10 SPPF       multi-scale pooled context, before attention mixes it
+#    9 C3k2       raw P5 features, before any pooling or attention
+# Every ScaledAdd has its own alpha starting at 0. Layer 9 is the least processed tap, so a large
+# learned alpha there would say the detect branch wants unpooled local detail that SPPF and C2PSA
+# are discarding, and a near-zero one would bound how far back the useful range extends.
+# Cost over triplesa: 1 parameter and one elementwise add at P5.
+# Parameters
+nc: 80 # number of classes
+end2end: True # whether to use end-to-end mode
+reg_max: 1 # DFL bins
+scale_args: [bb_e, neck_e, head_n] # names for scales entries beyond [depth, width, max_channels]
+scales: # model compound scaling constants, i.e. 'model=yolo26n.yaml' will call yolo26.yaml with scale 'n'
+  # [depth, width, max_channels, bb_e, neck_e, head_n]
+  n: [0.50, 0.25, 1024, 0.5, 0.5, 2] # best available; still -2.8% vs yolo26n (strip convs + rep blocks dominate at tiny width)
+  s: [0.50, 0.50, 1024, 0.5, 0.5, 3] # trained champion, do not change
+  m: [0.50, 1.00, 512, 0.25, 0.5, 2] # v2: bb_e/neck_e split (yolo26.yaml pattern), 1008 vs base 965 img/s (+4.4%), 22.6M fused
+  l: [1.00, 1.00, 512, 0.25, 0.5, 2] # v2 split: 813 vs base 789 img/s (+3.1%), 29.4M fused (uniform 0.3125: 804, 24.1M)
+  x: [1.00, 1.50, 512, 0.25, 0.375, 3] # v2 split: 455 vs base 439 img/s (+3.7%), 59.0M fused (uniform 0.3125: 449, 55.7M)
+
+# YOLO26n backbone
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C3k2Rep, [256, False, bb_e]] # 2 - rep block
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C3k2Rep, [512, False, bb_e]] # 4 - rep block
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, StripAttn, []] # 7 - strip gate at P4
+  - [-1, 1, Conv, [1024, 3, 2]] # 8-P5/32
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5, 3, True]] # 10
+  - [-1, 2, C2PSA, [1024]] # 11
+  - [-1, 1, StripAttn, []] # 12 - strip gate at P5
+
+# YOLO26n head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 7], 1, Concat, [1]]
+  - [-1, head_n, C3k2Rep, [512, True, neck_e]] # 15
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, head_n, C3k2Rep, [256, True, neck_e]] # 18
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 15], 1, Concat, [1]]
+  - [-1, 2, C3k2Rep, [512, True, neck_e]] # 21
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]]
+  - [-1, 2, C3k2Rep, [1024, True, neck_e, True]] # 24
+  - [[-1, 12], 1, ScaledAdd, []] # 25: gated backbone P5 (champion path, M/L)
+  - [[-1, 11], 1, ScaledAdd, []] # 26: ungated C2PSA (cleansa path, small)
+  - [[-1, 10], 1, ScaledAdd, []] # 27: SPPF, before C2PSA (multi-scale pooled context)
+  - [[-1, 9], 1, ScaledAdd, []] # 28: raw C3k2 P5, before SPPF (unpooled local detail)
+
+  - [[18, 21, 28], 1, Detect, [nc]]
