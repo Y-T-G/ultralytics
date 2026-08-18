@@ -94,7 +94,10 @@ def muon_update(
     buckets = {}  # group matrices transposed to rows <= cols by (rows, scale) for batched orthogonalization
     for i, u in enumerate(updates):
         m = u.view(len(u), -1) if u.ndim > 2 else u  # conv filters and other >2D params
-        scale = max(1, m.size(0) / m.size(1)) ** 0.5  # from the flattened matrix that is orthogonalized
+        # Scale from the flattened matrix that is orthogonalized, not the kernel dims. Depthwise filters
+        # are exempt: they flatten to (C, k*k), where each row is an independent tiny filter rather than a
+        # matrix acting on a feature space, and the fan-in of 3-9 would inflate the scale 4-9x.
+        scale = 1.0 if u.ndim > 2 and u.size(1) == 1 else max(1, m.size(0) / m.size(1)) ** 0.5
         transpose = m.size(0) > m.size(1)
         if transpose:
             m = m.T
