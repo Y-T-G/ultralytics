@@ -8,6 +8,7 @@ Usage:
     python model_flow.py yolo26s-rep-fpn-rep-sres-strip-dualsa.yaml        # a cfg name or path
     python model_flow.py runs/x/weights/best.pt --imgsz 640 --detail 24    # + full repr of layer 24
     python model_flow.py a.yaml --diff b.yaml                              # what changed between two models
+    python model_flow.py a.yaml --md -o a.md                               # markdown report for humans
 """
 
 from __future__ import annotations
@@ -221,6 +222,85 @@ def flow(model, imgsz: int = 640, detail: tuple[int, ...] = ()) -> str:
     return "\n".join(out)
 
 
+def _stage_of(sc: dict, i: int, n_backbone: int) -> str:
+    """Label a layer index as Backbone, Neck or Head."""
+    return "Backbone" if i < n_backbone else ("Head" if i == len(sc["layers"]) - 1 else "Neck")
+
+
+def flow_md(model, imgsz: int = 640) -> str:
+    """Return a markdown report of `model`'s graph: tables, skip list, per-level paths and a mermaid graph.
+
+    Same content as `flow`, formatted for a human reader instead of an LLM one.
+
+    Args:
+        model (nn.Module): A built detection model (`YOLO(...).model`).
+        imgsz (int): Square input size used for the shape-probing forward pass.
+
+    Returns:
+        (str): Markdown source.
+    """
+    sc = _scan(model, imgsz)
+    layers, shapes, srcs, consumers = sc["layers"], sc["shapes"], sc["srcs"], sc["consumers"]
+    n_backbone = len(model.yaml.get("backbone", []))
+    name = getattr(model, "yaml_file", None) or model.yaml.get("yaml_file", "model")
+    n_p = sum(p.numel() for p in model.parameters())
+    last = len(layers) - 1
+
+    md = [
+        f"# {name}",
+        "",
+        f"**{len(layers)} layers** · **{n_p:,} parameters** · input `1x3x{imgsz}x{imgsz}`",
+        "",
+        "## Layers",
+        "",
+        "| # | Stage | Module | Reads | Output C×H×W | Stride | Params | Feeds |",
+        "|--:|:--|:--|:--|:--|--:|--:|:--|",
+    ]
+    for i, m in enumerate(layers):
+        sh = shapes.get(i)
+        out_s = f"`{sh[1]}×{sh[2]}×{sh[3]}`" if sh else "—"
+        stride = f"/{imgsz // sh[2]}" if sh and sh[2] else "—"
+        reads = "image" if srcs[i] == [-1] else ", ".join(str(x) for x in srcs[i])
+        fed = consumers[i]
+        feeds = "**detect**" if i == last else (", ".join(str(x) for x in fed) if fed else "—")
+        if len(fed) > 1:
+            feeds = f"**{feeds}**"  # a skip source
+        mod = f"`{type(m).__name__}`"
+        md.append(f"| {i} | {_stage_of(sc, i, n_backbone)} | {mod} | {reads} | {out_s} | {stride} | {m.np:,} | {feeds} |")
+
+    md += ["", "## Skip and fusion sources", "", "Layers whose output is read more than once:", ""]
+    for i, c in consumers.items():
+        if len(c) > 1:
+            how = ", ".join(f"{x} (`{type(layers[x]).__name__}`)" for x in c)
+            md.append(f"- **{i}** `{type(layers[i]).__name__}` → {how}")
+
+    md += ["", "## Detection levels", "", "| Level | Layer | Channels | Stride |", "|:--|--:|--:|--:|"]
+    for d in srcs[last]:
+        sh = shapes.get(d)
+        st = imgsz // sh[2] if sh else 0
+        lvl = {8: "P3", 16: "P4", 32: "P5"}.get(st, "?")
+        md.append(f"| {lvl} | {d} `{type(layers[d]).__name__}` | {sh[1] if sh else '?'} | /{st} |")
+
+    scalars = [(n, p.detach().flatten().tolist()) for n, p in model.named_parameters() if p.numel() == 1]
+    if scalars:
+        md += ["", "## Learnable scalars", "", "| Parameter | Value |", "|:--|--:|"]
+        md += [f"| `{n}` | {v[0]:.4f} |" for n, v in scalars]
+
+    md += ["", "## Graph", "", "```mermaid", "flowchart TD"]
+    for i, m in enumerate(layers):
+        sh = shapes.get(i)
+        tag = f"{i} {type(m).__name__}" + (f"<br/>{sh[1]}ch /{imgsz // sh[2]}" if sh else "")
+        md.append(f'  L{i}["{tag}"]')
+    for i in range(len(layers)):
+        for j, src in enumerate(srcs[i]):
+            if src < 0:
+                continue
+            style = "-->" if src == i - 1 else "-.->"  # dotted = skip / non-sequential edge
+            md.append(f"  L{src} {style} L{i}")
+    md += ["```", ""]
+    return "\n".join(md)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
@@ -228,8 +308,18 @@ if __name__ == "__main__":
     ap.add_argument("--detail", type=int, nargs="*", default=())
     ap.add_argument("--diff", help="second model: report what changed from `model` to it")
     ap.add_argument("--all", action="store_true", help="diff mode: also list identical layers")
+    ap.add_argument("--md", action="store_true", help="markdown report for humans instead of the LLM dump")
+    ap.add_argument("-o", "--out", help="write the report to this file instead of stdout")
     a = ap.parse_args()
-    if a.diff:
-        print(diff(YOLO(a.model).model, YOLO(a.diff).model, a.imgsz, a.all))
+    if a.md:
+        report = flow_md(YOLO(a.model).model, a.imgsz)
+    elif a.diff:
+        report = diff(YOLO(a.model).model, YOLO(a.diff).model, a.imgsz, a.all)
     else:
-        print(flow(YOLO(a.model).model, a.imgsz, tuple(a.detail)))
+        report = flow(YOLO(a.model).model, a.imgsz, tuple(a.detail))
+    if a.out:
+        with open(a.out, "w") as f:
+            f.write(report + "\n")
+        print(f"wrote {a.out} ({len(report.splitlines())} lines)")
+    else:
+        print(report)
