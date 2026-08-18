@@ -1296,14 +1296,16 @@ class Add(nn.Module):
 class ScaledAdd(nn.Module):
     """Element-wise addition with a learnable scale on the residual input.
 
-    Computes x[0] + alpha * x[1] where alpha is a learnable scalar initialized to 0,
-    so training starts as pure x[0] and gradually learns the residual contribution.
+    Computes x[0] + alpha * x[1] where alpha is a learnable scalar initialized to 1, so the residual
+    starts active and training can scale it down. Zero-init was tried first and collapsed: trained
+    runs converged to alpha ~0.001 (0.1% of the main path), because the scalar also sat in the
+    weight-decayed group and had no gradient pulling it away from zero.
     """
 
-    def __init__(self):
-        """Initialize ScaledAdd with alpha=0."""
+    def __init__(self, alpha: float = 1.0):
+        """Initialize ScaledAdd with the given starting scale."""
         super().__init__()
-        self.alpha = nn.Parameter(torch.zeros(1))
+        self.alpha = nn.Parameter(torch.full((1,), alpha))
 
     def forward(self, x: list[torch.Tensor]):
         """Apply scaled addition.

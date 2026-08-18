@@ -94,10 +94,10 @@ def muon_update(
     buckets = {}  # group matrices transposed to rows <= cols by (rows, scale) for batched orthogonalization
     for i, u in enumerate(updates):
         m = u.view(len(u), -1) if u.ndim > 2 else u  # conv filters and other >2D params
+        scale = max(1, m.size(0) / m.size(1)) ** 0.5  # from the flattened matrix that is orthogonalized
         transpose = m.size(0) > m.size(1)
         if transpose:
             m = m.T
-        scale = max(1, grads[i].size(-2) / grads[i].size(-1)) ** 0.5
         buckets.setdefault((m.size(0), scale, m.device, m.dtype), []).append((i, m, transpose))
     for (_, scale, _, _), items in buckets.items():
         n = max(m.size(1) for _, m, _ in items)

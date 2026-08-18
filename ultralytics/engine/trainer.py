@@ -1132,8 +1132,10 @@ class BaseTrainer:
                     g[3][fullname] = param  # muon params
                 elif "bias" in fullname:  # bias (no decay)
                     g[2][fullname] = param
-                elif isinstance(module, bn) or "logit_scale" in fullname:  # weight (no decay)
-                    # ContrastiveHead and BNContrastiveHead included here with 'logit_scale'
+                elif isinstance(module, bn) or "logit_scale" in fullname or param.numel() == 1:  # weight (no decay)
+                    # ContrastiveHead and BNContrastiveHead included here with 'logit_scale'; scalar
+                    # mixers (ScaledAdd alpha, gate scales) are excluded too, since decay drives the
+                    # feature they gate to zero rather than letting the loss choose its weight
                     g[1][fullname] = param
                 else:  # weight (with decay)
                     g[0][fullname] = param
@@ -1169,8 +1171,11 @@ class BaseTrainer:
             g[3] = {"params": g[3], **optim_args, "weight_decay": decay, "use_muon": True, "param_group": "muon"}
             import re
 
-            # higher lr for certain parameters in MuSGD when funetuning
-            pattern = re.compile(r"(?=.*23)(?=.*(cv3|o2o_cls_res|o2o_sel))|proto\.semseg|flow_model")
+            # higher lr for certain parameters in MuSGD when funetuning. The head index is read from
+            # the model: hard-coding 23 silently skipped the boost on any config whose Detect sits
+            # elsewhere (every -sres/-strip variant here, where it is 25-27).
+            head_i = getattr(unwrap_model(model).model[-1], "i", 23)
+            pattern = re.compile(rf"^model\.{head_i}\..*(cv3|o2o_cls_res|o2o_sel)|proto\.semseg|flow_model")
             g_ = []  # new param groups
             for x in g:
                 p = x.pop("params")
