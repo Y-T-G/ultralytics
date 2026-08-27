@@ -1,17 +1,13 @@
 name: OpenVINO Hang Repro
 
 on:
-  workflow_dispatch:
-    inputs:
-      reps:
-        description: "Repetitions per shard"
-        default: "10"
-      iters:
-        description: "Batch inferences per repetition"
-        default: "20"
-      hint:
-        description: "PERFORMANCE_HINT"
-        default: "THROUGHPUT"
+  push:
+    branches: [ovhang-repro]
+
+env:
+  REPS: "10"
+  ITERS: "20"
+  HINT: THROUGHPUT
 
 jobs:
   repro:
@@ -39,9 +35,9 @@ jobs:
       - name: Repro
         run: |
           hangs=0
-          for r in $(seq 1 ${{ inputs.reps }}); do
+          for r in $(seq 1 $REPS); do
             timeout 180 python .github/ovhang/ovhang.py yolo26n_openvino_model/yolo26n.xml \
-              ${{ inputs.hint }} ${{ inputs.iters }} 8 percall > rep.out 2>&1
+              $HINT $ITERS 8 percall > rep.out 2>&1
             rc=$?
             echo "shard ${{ matrix.shard }} rep $r rc=$rc | $(tail -1 rep.out) | $(head -1 rep.out)"
             if [ "$rc" = "124" ]; then
@@ -49,5 +45,5 @@ jobs:
               cat rep.out
             fi
           done
-          echo "HANGS=$hangs/${{ inputs.reps }} cpu=$(lscpu | sed -n 's/^Model name: *//p')"
+          echo "HANGS=$hangs/$REPS cpu=$(lscpu | sed -n 's/^Model name: *//p')"
           [ "$hangs" = "0" ]
