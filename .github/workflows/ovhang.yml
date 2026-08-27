@@ -5,8 +5,8 @@ on:
     branches: [ovhang-repro]
 
 env:
-  REPS: "20"
-  ITERS: "20"
+  REPS: "10"
+  ITERS: "100"
   HINT: THROUGHPUT
 
 jobs:
