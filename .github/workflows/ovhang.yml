@@ -5,7 +5,7 @@ on:
     branches: [ovhang-repro]
 
 env:
-  REPS: "10"
+  REPS: "20"
   ITERS: "20"
   HINT: THROUGHPUT
 
@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
