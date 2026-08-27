@@ -1,0 +1,53 @@
+name: OpenVINO Hang Repro
+
+on:
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: "Repetitions per shard"
+        default: "10"
+      iters:
+        description: "Batch inferences per repetition"
+        default: "20"
+      hint:
+        description: "PERFORMANCE_HINT"
+        default: "THROUGHPUT"
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: uv pip install --system -e ".[export-base]" --torch-backend cpu
+      - name: Machine
+        run: |
+          lscpu | grep -E "^Model name|^CPU\(s\)|^Thread|^Core"
+          grep -c amx_int8 /proc/cpuinfo || true
+          python -c "import openvino; print('openvino', openvino.__version__)"
+      - name: Export dynamic FP16 IR
+        run: yolo export model=yolo26n.pt format=openvino imgsz=640 batch=8 dynamic=True half=True
+      - name: Repro
+        run: |
+          hangs=0
+          for r in $(seq 1 ${{ inputs.reps }}); do
+            timeout 180 python .github/ovhang/ovhang.py yolo26n_openvino_model/yolo26n.xml \
+              ${{ inputs.hint }} ${{ inputs.iters }} 8 percall > rep.out 2>&1
+            rc=$?
+            echo "shard ${{ matrix.shard }} rep $r rc=$rc | $(tail -1 rep.out) | $(head -1 rep.out)"
+            if [ "$rc" = "124" ]; then
+              hangs=$((hangs + 1))
+              cat rep.out
+            fi
+          done
+          echo "HANGS=$hangs/${{ inputs.reps }} cpu=$(lscpu | sed -n 's/^Model name: *//p')"
+          [ "$hangs" = "0" ]
