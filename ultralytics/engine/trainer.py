@@ -28,7 +28,7 @@ from ultralytics import __version__
 from ultralytics.cfg import _YOLO_CLI_COMMAND, get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset, convert_ndjson_to_yolo_if_needed
 from ultralytics.nn.distill_model import DistillationModel
-from ultralytics.nn.tasks import load_checkpoint
+from ultralytics.nn.tasks import load_checkpoint, yaml_model_load
 from ultralytics.optim import MuSGD
 from ultralytics.utils import (
     DEFAULT_CFG,
@@ -846,6 +846,9 @@ class BaseTrainer:
         if str(self.model).endswith(".pt"):
             weights, ckpt = load_checkpoint(self.model)
             cfg = weights.yaml
+        else:  # DFL bins so a stride-32 anchor reaches the far edge of an object spanning the whole image
+            cfg = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)
+            cfg.setdefault("reg_max", max(16, self.args.imgsz // 64 + 2))
         if isinstance(self.args.pretrained, (str, Path)) and not self.resume:
             weights, _ = load_checkpoint(self.args.pretrained)
         elif self.args.pretrained is False and not self.resume:
