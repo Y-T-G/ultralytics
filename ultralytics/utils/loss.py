@@ -368,6 +368,7 @@ class v8DetectionLoss:
             beta=6.0,
             stride=self.stride.tolist(),
             topk2=tal_topk2,
+            reg_max=m.reg_max,
         )
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
@@ -430,6 +431,7 @@ class v8DetectionLoss:
             gt_labels,
             gt_bboxes,
             mask_gt,
+            stride_tensor,
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
@@ -1034,6 +1036,7 @@ class v8OBBLoss(v8DetectionLoss):
             beta=6.0,
             stride=self.stride.tolist(),
             topk2=tal_topk2,
+            reg_max=self.reg_max,
         )
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
 
@@ -1102,6 +1105,7 @@ class v8OBBLoss(v8DetectionLoss):
             gt_labels,
             gt_bboxes,
             mask_gt,
+            stride_tensor,
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
